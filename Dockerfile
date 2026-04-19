@@ -6,6 +6,7 @@ RUN apt-get update \
       curl \
       git \
       openssh-client \
+      tmux \
  && rm -rf /var/lib/apt/lists/*
 
 # Install mise under /root/.local so it lands inside the project's persistent

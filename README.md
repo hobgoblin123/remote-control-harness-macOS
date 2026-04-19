@@ -94,8 +94,9 @@ runs on demand inside the container, not at launch.
   into `FORWARD`, runs the container, cleans up on exit.
 - [setup.sh](setup.sh) — runs inside the container as the entrypoint.
   Installs the deploy key, clones the repo (or reuses an existing
-  checkout), starts the webapp under `nohup`, starts claude-rc, then
-  `exec`s `claude` as the foreground process. Every step is idempotent.
+  checkout), then starts three tmux sessions: `devserver`,
+  `remote-control`, and `claude` (the interactive one, which is attached
+  in the foreground). Every step is idempotent.
 - [TODO.md](TODO.md) — known limitations of the current hardening.
 
 ## Connecting from your phone
@@ -112,8 +113,25 @@ call, it's almost always a missing host in `WHITELIST_HOSTS`. Add the
 hostname, relaunch. IPs are re-resolved on each launch, so a stale
 allowlist only costs you a container restart.
 
-## Claude remote-control invocation
+## Claude remote-control
 
-[setup.sh](setup.sh) currently calls `claude-rc --port "$RC_PORT" --bind 0.0.0.0`
-as a placeholder — swap it for whatever start command your claude
-remote-control distribution uses.
+[setup.sh](setup.sh) starts `claude remote-control` inside a detached
+tmux session named `remote-control` on container boot. Two ways to see
+what it's doing:
+
+```bash
+# Attach to the live tmux session (Ctrl-b d to detach without killing it)
+podman exec -it remote-code-<project> tmux attach -t remote-control
+
+# Or just tail the mirrored log
+podman exec -it remote-code-<project> tail -f /var/log/remote-code/remote-control.log
+```
+
+The first time you connect, grab the pairing URL/code from there and
+hand it to your phone. Auth persists in the volume, so subsequent
+launches don't need re-pairing.
+
+If the server isn't reachable from the host on `127.0.0.1:$RC_PORT`,
+check what interface it bound to — `claude remote-control` needs to
+bind to `0.0.0.0` inside the container for podman's port publish to
+forward correctly (same gotcha as the webapp).
