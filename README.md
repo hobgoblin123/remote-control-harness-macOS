@@ -108,9 +108,10 @@ runs on demand inside the container, not at launch.
   network for `--rootful`), runs the container, cleans up on exit.
 - [setup.sh](setup.sh) — runs inside the container as the entrypoint.
   Installs the deploy key, clones the repo (or reuses an existing
-  checkout), then starts three tmux sessions: `devserver`,
-  `remote-control`, and `claude` (the interactive one, which is attached
-  in the foreground). Every step is idempotent.
+  checkout), then starts two tmux sessions: `devserver` and
+  `remote-control`. Then `exec`s into `sleep infinity` to keep the
+  container alive — `podman exec -it ... bash` in to use claude or attach
+  to the tmux sessions. Every step is idempotent.
 - [TODO.md](TODO.md) — known limitations of the current hardening.
 
 ## Connecting from your phone
@@ -184,7 +185,7 @@ what it's doing:
 podman exec -it remote-code-<project> tmux attach -t remote-control
 
 # Or just tail the mirrored log
-podman exec -it remote-code-<project> tail -f /var/log/remote-code/remote-control.log
+podman exec -it remote-code-<project> tail -f /root/.logs/remote-control.log
 ```
 
 The first time you connect, grab the pairing URL/code from there and

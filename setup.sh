@@ -85,11 +85,11 @@ fi
 cd "$WORKDIR"
 
 log "starting devserver in tmux session 'devserver': $WEBAPP_CMD"
-mkdir -p /var/log/remote-code
+mkdir -p /root/.logs
 tmux new-session -d -s devserver -c "$WORKDIR" "$WEBAPP_CMD; echo '[devserver exited]'; exec bash"
-tmux pipe-pane -t devserver -o 'cat >>/var/log/remote-code/devserver.log'
+tmux pipe-pane -t devserver -o 'cat >>/root/.logs/devserver.log'
 echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t devserver"
-echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /var/log/remote-code/devserver.log"
+echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/devserver.log"
 
 log "starting claude remote-control in tmux session 'remote-control'"
 # tmux inherits setup.sh's PATH (mise shims are on it), so `claude` resolves.
@@ -97,25 +97,57 @@ log "starting claude remote-control in tmux session 'remote-control'"
 # so you can poke around instead of losing the window.
 tmux new-session -d -s remote-control 'claude remote-control; echo "[claude remote-control exited]"; exec bash'
 # Mirror pane output to a log file too, so you can tail without attaching.
-tmux pipe-pane -t remote-control -o 'cat >>/var/log/remote-code/remote-control.log'
+tmux pipe-pane -t remote-control -o 'cat >>/root/.logs/remote-control.log'
 echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t remote-control"
-echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /var/log/remote-code/remote-control.log"
+echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/remote-control.log"
 
-log "starting claude in tmux session 'claude' (repo: $WORKDIR)"
-tmux new-session -d -s claude -c "$WORKDIR" claude
-tmux pipe-pane -t claude -o 'cat >>/var/log/remote-code/claude.log'
+CNAME="remote-code-$PROJECT_NAME"
+cat <<EOF
 
-echo
-echo "  Ctrl-b d detaches without killing; reattach anytime via:"
-echo "  podman exec -it remote-code-$PROJECT_NAME tmux attach -t claude"
-echo
+============================================================
+  Dev container '$CNAME' is up and running.
+============================================================
 
-# Foreground attach. On detach we fall through to the wait loop, so the
-# container keeps running and can be reattached. On claude exit, the session
-# disappears, the loop breaks, setup.sh ends, and the container shuts down.
-tmux attach -t claude || true
+Shell into the container:
+  podman exec -it $CNAME bash
 
-echo "==> detached — waiting for claude session to end before shutting down"
-while tmux has-session -t claude 2>/dev/null; do
-    sleep 1
-done
+Running tmux sessions (sessions persist across attach/detach;
+Ctrl-b d to detach without killing them):
+
+  devserver        — your webapp ($WEBAPP_CMD), bound to port $WEBAPP_PORT
+    attach: podman exec -it $CNAME tmux attach -t devserver
+    log:    podman exec -it $CNAME tail -f /root/.logs/devserver.log
+
+  remote-control   — 'claude remote-control' on port $RC_PORT;
+                     pairing URL/code shows up here on first connect
+    attach: podman exec -it $CNAME tmux attach -t remote-control
+    log:    podman exec -it $CNAME tail -f /root/.logs/remote-control.log
+
+Connect with VSCode (Dev Containers):
+
+  1. On THIS host, enable podman's docker-compat socket so VSCode can
+     see the container:
+       systemctl --user enable --now podman.socket     # rootless mode
+       sudo systemctl enable --now podman.socket       # --rootful mode
+
+  2. On your local machine, install the 'Dev Containers' extension
+     (ms-vscode-remote.remote-containers) and add to settings.json:
+       "dev.containers.dockerPath": "podman",
+       "docker.host": "ssh://user@<this-host>"   # omit if local
+
+  3. Command Palette -> 'Dev Containers: Attach to Running Container...'
+     -> pick '$CNAME'.
+
+  4. In the new VSCode window, install the 'Claude Code' extension —
+     it lands on the persistent volume and survives relaunches. The
+     extension spawns its own claude; it does NOT share state with the
+     'remote-control' tmux session above.
+
+To stop the container:
+  podman stop $CNAME
+
+============================================================
+
+EOF
+
+exec sleep infinity

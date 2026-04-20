@@ -136,7 +136,21 @@ else
 fi
 
 # Both modes need sudo (nft in rootless; podman+iptables in rootful). Prime it.
-if ! sudo -n true 2>/dev/null; then sudo -v || { echo "error: sudo required" >&2; exit 1; }; fi
+if ! sudo -n true 2>/dev/null; then
+    echo
+    echo "  ┌──────────────────────────────────────────────────────────────────┐"
+    if [[ $MODE == rootless ]]; then
+        echo "  │  sudo is required to install the host nftables egress filter.   │"
+        echo "  │  The container itself will still run rootlessly — only the nft  │"
+        echo "  │  table (which lives in the host network namespace) needs root.  │"
+    else
+        echo "  │  sudo is required to run rootful podman and install the         │"
+        echo "  │  iptables FORWARD-chain egress filter on the host.              │"
+    fi
+    echo "  └──────────────────────────────────────────────────────────────────┘"
+    echo
+    sudo -v || { echo "error: sudo required" >&2; exit 1; }
+fi
 
 # ---- base image ------------------------------------------------------------
 
