@@ -7,7 +7,19 @@ RUN apt-get update \
       git \
       openssh-client \
       tmux \
+      ripgrep \
+      fd-find \
+      unzip \
+      build-essential \
  && rm -rf /var/lib/apt/lists/*
+
+# Neovim from the official prebuilt tarball — Ubuntu 24.04's apt nvim (0.9.5)
+# is older than what current LazyVim requires. `stable` is a moving tag that
+# points at the latest stable release; pin if you need reproducibility across
+# base-image rebuilds.
+RUN curl -fsSL "https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz" \
+      | tar -xz -C /opt \
+ && ln -s /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
 
 # Install mise under /root/.local so it lands inside the project's persistent
 # volume on first launch (podman initializes empty named volumes from the
@@ -27,6 +39,15 @@ RUN mkdir -p "$PNPM_HOME" \
  && mise use -g node@lts pnpm@latest \
  && mise exec -- pnpm add -g @anthropic-ai/claude-code \
  && mise exec -- node "$(mise exec -- pnpm root -g)/@anthropic-ai/claude-code/install.cjs"
+
+# Seed the LazyVim starter config into /root/.config/nvim. Like /root/.local
+# above, this is copied into the project's persistent volume on first launch,
+# so user customizations survive across launches. Plugins are not preinstalled
+# — lazy.nvim fetches them on first `nvim` run, which needs github.com (and
+# the other hosts in sample.env's WHITELIST_HOSTS) reachable from inside the
+# container.
+RUN git clone --depth 1 https://github.com/LazyVim/starter /root/.config/nvim \
+ && rm -rf /root/.config/nvim/.git
 
 # Interactive shells inside the container should get mise + pnpm on PATH.
 RUN printf '%s\n' \
