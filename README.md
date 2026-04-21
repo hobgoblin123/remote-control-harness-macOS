@@ -1,7 +1,26 @@
 # remote-code-harness
 
-Spins up a network-hardened Linux container for working on a single
-project from somewhere else — a phone, a tablet, another laptop.
+## Overview
+
+Spins up a network-hardened Linux container for dev environments.
+
+This container comes built in with:
+
+1. Claude
+2. Lazyvim
+3. Mise
+4. Network security that prevents egress to any non-whitelisted IPs
+
+It runs in rootless mode using podman. It clones your code into the container.
+
+Configuring your .env file with the repo URL and deployment keys (which have access only to the repo you are working) on ensures that should your instance be compromised, the risk of container escape and access to your local machine is minimized. Which is a signficant concern when using claude code + remote control + the crazy state of the Node package ecosystem.
+
+This also sets up a podman socket on your local instance with which VSCode can connect to using the 'Attach to Running Container Command' of the Dev Containers Extension provided by Microsoft.
+
+Theoretically, this can also be configured to run on a remote instance.
+
+## Details
+
 You run `./launch.sh` on a host machine, and you end up with:
 
 - A local base image (`remote-code-base:latest`) built once from the
@@ -24,7 +43,7 @@ Container posture: `--cap-drop=ALL`, `no-new-privileges`, 4G RAM / 2 CPU /
 256 pids cap. The deploy key is mounted read-only and scoped to the one
 repo by whoever issued it.
 
-## Modes
+## Usage Modes
 
 `launch.sh` runs in one of two modes:
 
