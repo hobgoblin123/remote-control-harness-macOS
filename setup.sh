@@ -145,9 +145,17 @@ Connect with VSCode (Dev Containers):
 
 To stop the container:
   podman stop $CNAME
+  or: press Ctrl+C / Ctrl+D in this terminal
 
 ============================================================
 
 EOF
 
-exec sleep infinity
+# Hold the container open until the user hits Ctrl+C (SIGINT) or Ctrl+D (EOF
+# on stdin). We can't `exec sleep infinity` because sleep as PID 1 ignores
+# default signal actions and doesn't read stdin. Staying in bash with an
+# explicit trap + a stdin read gives us both.
+trap 'echo; echo "shutting down..."; exit 0' INT TERM
+cat >/dev/null || true
+echo
+echo "stdin closed, shutting down..."

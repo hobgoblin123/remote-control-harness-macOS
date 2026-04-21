@@ -46,14 +46,28 @@ RUN mkdir -p "$PNPM_HOME" \
  && mise exec -- pnpm add -g @anthropic-ai/claude-code \
  && mise exec -- node "$(mise exec -- pnpm root -g)/@anthropic-ai/claude-code/install.cjs"
 
-# Seed the LazyVim starter config into /root/.config/nvim. Like /root/.local
-# above, this is copied into the project's persistent volume on first launch,
-# so user customizations survive across launches. Plugins are not preinstalled
-# — lazy.nvim fetches them on first `nvim` run, which needs github.com (and
-# the other hosts in sample.env's WHITELIST_HOSTS) reachable from inside the
-# container.
+# tree-sitter CLI: LazyVim's treesitter config invokes this at first nvim
+# startup to compile/verify parser grammars. Installing via pnpm would emit
+# the "Ignored build scripts" warning because the npm package's only job is a
+# postinstall that downloads this same binary from GitHub releases — and pnpm
+# v10 blocks postinstall on global installs. Skip the middleman.
+RUN curl -fsSL "https://github.com/tree-sitter/tree-sitter/releases/latest/download/tree-sitter-linux-x64.gz" \
+      | gunzip > /usr/local/bin/tree-sitter \
+ && chmod +x /usr/local/bin/tree-sitter
+
+# Seed the LazyVim starter config into /root/.config/nvim, then pre-install
+# plugins and treesitter parsers so the first interactive `nvim` run doesn't
+# race async installers (opening a .tsx before the tsx parser finishes
+# downloading throws "No parser for language 'tsx'"). /root is copied into
+# the project's persistent volume on first launch, so /root/.local/share/nvim
+# (plugins) and /root/.local/state/nvim (parsers) land in the volume too.
 RUN git clone --depth 1 https://github.com/LazyVim/starter /root/.config/nvim \
- && rm -rf /root/.config/nvim/.git
+ && rm -rf /root/.config/nvim/.git \
+ && nvim --headless "+Lazy! sync" +qa \
+ && nvim --headless \
+      "+Lazy! load nvim-treesitter" \
+      "+TSInstallSync bash c diff html javascript jsdoc json jsonc lua luadoc markdown markdown_inline python query regex toml tsx typescript vim vimdoc xml yaml" \
+      +qa
 
 # Interactive shells inside the container should get mise + pnpm on PATH.
 RUN printf '%s\n' \

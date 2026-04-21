@@ -7,29 +7,40 @@ MODE=rootless
 RESET=false
 REBUILD_BASE=false
 VERIFY=false
+DISABLE_NETWORK_BLOCK=false
 ENV_FILE=".env"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rootful)       MODE=rootful; shift ;;
-        --reset)         RESET=true; shift ;;
-        --rebuild-base)  REBUILD_BASE=true; shift ;;
-        --verify)        VERIFY=true; shift ;;
+        --rootful)                MODE=rootful; shift ;;
+        --reset)                  RESET=true; shift ;;
+        --rebuild-base)           REBUILD_BASE=true; shift ;;
+        --verify)                 VERIFY=true; shift ;;
+        --disable-network-block)  DISABLE_NETWORK_BLOCK=true; shift ;;
         -h|--help)
             cat <<EOF
-usage: $0 [--rootful] [--reset] [--rebuild-base] [--verify] [env-file]
+usage: $0 [--rootful] [--reset] [--rebuild-base] [--verify]
+          [--disable-network-block] [env-file]
 
 default mode: rootless podman + --network=pasta + nftables cgroup-v2 match
 on OUTPUT for egress filtering. prereqs: pasta, nftables, systemd --user
 session (loginctl enable-linger <you> if not logged in).
 
-  --rootful       fallback to rootful podman + netavark bridge + iptables
-                  FORWARD egress filter. requires sudo for the podman
-                  invocation itself; volume/image live in root's store, so
-                  the first --rootful launch rebuilds both.
-  --reset         wipe the persistent volume for the current mode
-  --rebuild-base  force rebuild of the base image
-  --verify        after launch, run a short egress check and exit
-  env-file        path to env file (default: .env)
+  --rootful                 fallback to rootful podman + netavark bridge +
+                            iptables FORWARD egress filter. requires sudo
+                            for the podman invocation itself; volume/image
+                            live in root's store, so the first --rootful
+                            launch rebuilds both.
+  --reset                   wipe the persistent volume for the current mode
+  --rebuild-base            force rebuild of the base image from scratch
+                            (passes --no-cache so every layer re-runs;
+                            use this when a step's inputs changed
+                            semantically without the RUN line changing)
+  --verify                  after launch, run a short egress check and exit
+  --disable-network-block   run the container without egress restrictions.
+                            skips nft/iptables setup and the WHITELIST_HOSTS
+                            allowlist; all outbound traffic is permitted.
+                            mutually exclusive with --verify.
+  env-file                  path to env file (default: .env)
 EOF
             exit 0
             ;;
@@ -37,6 +48,11 @@ EOF
         *)  ENV_FILE="$1"; shift ;;
     esac
 done
+
+if $VERIFY && $DISABLE_NETWORK_BLOCK; then
+    echo "error: --verify and --disable-network-block are mutually exclusive." >&2
+    exit 1
+fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "error: $ENV_FILE not found. copy sample.env to .env and edit it." >&2
@@ -54,7 +70,9 @@ set +a
 : "${WEBAPP_CMD:?WEBAPP_CMD must be set}"
 : "${WEBAPP_PORT:?WEBAPP_PORT must be set}"
 : "${RC_PORT:?RC_PORT must be set}"
-: "${WHITELIST_HOSTS:?WHITELIST_HOSTS must be set}"
+if ! $DISABLE_NETWORK_BLOCK; then
+    : "${WHITELIST_HOSTS:?WHITELIST_HOSTS must be set}"
+fi
 
 # Canary IP the container tries to reach at startup to prove the egress
 # filter is enforcing. Must be reachable on the open internet (so its
@@ -117,11 +135,13 @@ if [[ $MODE == rootless ]]; then
         exit 1
     fi
     command -v pasta >/dev/null || { echo "error: pasta not installed. try 'apt install passt'." >&2; exit 1; }
-    command -v nft   >/dev/null || { echo "error: nft not installed. try 'apt install nftables'." >&2; exit 1; }
-    command -v systemd-run >/dev/null || { echo "error: systemd-run required." >&2; exit 1; }
-    if ! systemctl --user show-environment >/dev/null 2>&1; then
-        echo "error: systemd --user session unavailable. run 'loginctl enable-linger $USER' and re-login." >&2
-        exit 1
+    if ! $DISABLE_NETWORK_BLOCK; then
+        command -v nft   >/dev/null || { echo "error: nft not installed. try 'apt install nftables'." >&2; exit 1; }
+        command -v systemd-run >/dev/null || { echo "error: systemd-run required." >&2; exit 1; }
+        if ! systemctl --user show-environment >/dev/null 2>&1; then
+            echo "error: systemd --user session unavailable. run 'loginctl enable-linger $USER' and re-login." >&2
+            exit 1
+        fi
     fi
     if ! podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qi true; then
         echo "error: podman is not configured for rootless operation." >&2
@@ -135,8 +155,10 @@ else
     fi
 fi
 
-# Both modes need sudo (nft in rootless; podman+iptables in rootful). Prime it.
-if ! sudo -n true 2>/dev/null; then
+# When the egress filter is active, both modes need sudo (nft in rootless;
+# podman+iptables in rootful). With --disable-network-block, rootless needs
+# no sudo at all, and rootful only needs what was primed above for podman.
+if ! $DISABLE_NETWORK_BLOCK && ! sudo -n true 2>/dev/null; then
     echo
     echo "  ┌──────────────────────────────────────────────────────────────────┐"
     if [[ $MODE == rootless ]]; then
@@ -158,7 +180,10 @@ fi
 # build to keep the smoke test fast on first run.
 if $VERIFY; then
     echo "==> --verify: skipping base image build"
-elif $REBUILD_BASE || ! "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+elif $REBUILD_BASE; then
+    echo "==> rebuilding base image $IMAGE_NAME from scratch (mode=$MODE, --no-cache)"
+    "${PODMAN[@]}" build --no-cache -t "$IMAGE_NAME" -f "$DOCKERFILE" "$SCRIPT_DIR"
+elif ! "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     echo "==> building base image $IMAGE_NAME (mode=$MODE)"
     "${PODMAN[@]}" build -t "$IMAGE_NAME" -f "$DOCKERFILE" "$SCRIPT_DIR"
 else
@@ -167,48 +192,55 @@ fi
 
 # ---- resolve allowlist -----------------------------------------------------
 
-echo "==> resolving allowlist"
 declare -a ALLOWED_IPS=()
 declare -a ADD_HOST_ARGS=()
 declare -A SEEN_IPS=()
 
-for h in $ALL_HOSTS; do
-    ips=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u || true)
-    if [[ -z "$ips" ]]; then
-        echo "    warn: $h did not resolve — skipping"
-        continue
-    fi
-    first_ip=$(echo "$ips" | head -n1)
-    ADD_HOST_ARGS+=(--add-host "${h}:${first_ip}")
-    while IFS= read -r ip; do
-        if [[ -z "${SEEN_IPS[$ip]:-}" ]]; then
-            ALLOWED_IPS+=("$ip")
-            SEEN_IPS[$ip]=1
+if $DISABLE_NETWORK_BLOCK; then
+    echo "==> --disable-network-block: skipping allowlist resolution"
+else
+    echo "==> resolving allowlist"
+    for h in $ALL_HOSTS; do
+        ips=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u || true)
+        if [[ -z "$ips" ]]; then
+            echo "    warn: $h did not resolve — skipping"
+            continue
         fi
-    done <<< "$ips"
-    printf '    %-40s -> %s\n' "$h" "$(echo $ips | tr '\n' ' ')"
-done
+        first_ip=$(echo "$ips" | head -n1)
+        ADD_HOST_ARGS+=(--add-host "${h}:${first_ip}")
+        while IFS= read -r ip; do
+            if [[ -z "${SEEN_IPS[$ip]:-}" ]]; then
+                ALLOWED_IPS+=("$ip")
+                SEEN_IPS[$ip]=1
+            fi
+        done <<< "$ips"
+        printf '    %-40s -> %s\n' "$h" "$(echo $ips | tr '\n' ' ')"
+    done
 
-if [[ ${#ALLOWED_IPS[@]} -eq 0 ]]; then
-    echo "error: no hosts resolved. check DNS and WHITELIST_HOSTS." >&2
-    exit 1
-fi
-
-# Guard against the canary being accidentally on the allowlist — that would
-# make the container's self-check pass even when the filter is broken.
-for ip in "${ALLOWED_IPS[@]}"; do
-    if [[ "$ip" == "$CANARY_BLOCKED_IP" ]]; then
-        echo "error: CANARY_BLOCKED_IP ($CANARY_BLOCKED_IP) is in the resolved allowlist." >&2
-        echo "       pick a different canary via the CANARY_BLOCKED_IP env var." >&2
+    if [[ ${#ALLOWED_IPS[@]} -eq 0 ]]; then
+        echo "error: no hosts resolved. check DNS and WHITELIST_HOSTS." >&2
         exit 1
     fi
-done
+
+    # Guard against the canary being accidentally on the allowlist — that would
+    # make the container's self-check pass even when the filter is broken.
+    for ip in "${ALLOWED_IPS[@]}"; do
+        if [[ "$ip" == "$CANARY_BLOCKED_IP" ]]; then
+            echo "error: CANARY_BLOCKED_IP ($CANARY_BLOCKED_IP) is in the resolved allowlist." >&2
+            echo "       pick a different canary via the CANARY_BLOCKED_IP env var." >&2
+            exit 1
+        fi
+    done
+fi
 
 # ---- cleanup trap (registered BEFORE any mutation) -------------------------
 
 cleanup() {
     echo
     echo "==> tearing down ($MODE)"
+    if $DISABLE_NETWORK_BLOCK; then
+        return
+    fi
     if [[ $MODE == rootless ]]; then
         sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
         systemctl --user stop "$WARMUP_UNIT" 2>/dev/null || true
@@ -224,7 +256,9 @@ trap cleanup EXIT INT TERM
 
 # ---- install egress filter -------------------------------------------------
 
-if [[ $MODE == rootless ]]; then
+if $DISABLE_NETWORK_BLOCK; then
+    echo "==> --disable-network-block: skipping egress filter install"
+elif [[ $MODE == rootless ]]; then
     # Pre-create the slice via a warmup service so the cgroup exists before
     # we install the nft rule (nft resolves cgroupv2 paths to inodes at
     # rule-load time; the path must exist then). The warmup holds the slice
@@ -372,18 +406,35 @@ if [[ $MODE == rootless ]]; then
         exit 0
     fi
 
-    systemd-run --user --scope --quiet --slice="$SLICE_NAME" -- \
+    if $DISABLE_NETWORK_BLOCK; then
+        # No slice / nft filter: run podman directly on pasta, no egress
+        # restrictions.
         podman "${PODMAN_ARGS[@]}" \
-        --network=pasta \
-        "$IMAGE_NAME" \
-        /bin/bash /setup.sh
+            --network=pasta \
+            "$IMAGE_NAME" \
+            /bin/bash /setup.sh
+    else
+        systemd-run --user --scope --quiet --slice="$SLICE_NAME" -- \
+            podman "${PODMAN_ARGS[@]}" \
+            --network=pasta \
+            "$IMAGE_NAME" \
+            /bin/bash /setup.sh
+    fi
 else
     if $VERIFY; then
         echo "error: --verify is only implemented for rootless mode" >&2
         exit 1
     fi
-    sudo podman "${PODMAN_ARGS[@]}" \
-        --network "$NET_NAME" \
-        "$IMAGE_NAME" \
-        /bin/bash /setup.sh
+    if $DISABLE_NETWORK_BLOCK; then
+        # No custom bridge / iptables filter: fall back to podman's default
+        # network. All outbound traffic is permitted.
+        sudo podman "${PODMAN_ARGS[@]}" \
+            "$IMAGE_NAME" \
+            /bin/bash /setup.sh
+    else
+        sudo podman "${PODMAN_ARGS[@]}" \
+            --network "$NET_NAME" \
+            "$IMAGE_NAME" \
+            /bin/bash /setup.sh
+    fi
 fi
