@@ -243,6 +243,53 @@ if ! $DISABLE_NETWORK_BLOCK && ! sudo -n true 2>/dev/null; then
     sudo -v || { echo "error: sudo required" >&2; exit 1; }
 fi
 
+# ---- --reset: confirm destroy up-front ------------------------------------
+# We do the scan + prompt here (before rebuild-base, before allowlist
+# resolution, before nft/iptables install) so that aborting doesn't waste
+# a multi-minute base-image rebuild or leave a half-installed egress
+# filter that the trap then has to clean up. The actual rm of the
+# container/volume still happens later, next to the volume-create step.
+if ! $VERIFY && $RESET; then
+    if "${PODMAN[@]}" volume inspect "$VOLUME_NAME" >/dev/null 2>&1 \
+       && "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        echo "==> --reset: scanning /root/work for uncommitted/unpushed git state"
+        DIRTY_REPORT=$(
+            "${PODMAN[@]}" run --rm \
+                --volume "$VOLUME_NAME:/root:ro" \
+                "$IMAGE_NAME" \
+                bash -c '
+set +e
+while IFS= read -r gitdir; do
+    repo=${gitdir%/.git}
+    cd "$repo" 2>/dev/null || continue
+    status=$(git status --porcelain 2>/dev/null)
+    unpushed=$(git rev-list --count --all --not --remotes 2>/dev/null || echo 0)
+    stashes=$(git stash list 2>/dev/null)
+    if [ -n "$status" ] || [ "${unpushed:-0}" -gt 0 ] || [ -n "$stashes" ]; then
+        echo "--- $repo ---"
+        [ -n "$status" ] && { echo "  working tree:"; echo "$status" | sed "s/^/    /"; }
+        [ "${unpushed:-0}" -gt 0 ] && echo "  unpushed commits: $unpushed (not reachable from any remote)"
+        [ -n "$stashes" ] && { echo "  stashes:"; echo "$stashes" | sed "s/^/    /"; }
+        echo
+    fi
+done < <(find /root/work -maxdepth 5 -type d -name .git 2>/dev/null)
+' 2>/dev/null
+        )
+        if [[ -n "$DIRTY_REPORT" ]]; then
+            echo
+            echo "$DIRTY_REPORT"
+            echo "The following state in /root/work would be lost on --reset."
+            read -r -p "Proceed anyway? [y/N] " REPLY
+            if [[ "$REPLY" != "y" && "$REPLY" != "Y" ]]; then
+                echo "aborted"
+                exit 1
+            fi
+        else
+            echo "    /root/work is clean"
+        fi
+    fi
+fi
+
 # ---- base image ------------------------------------------------------------
 
 # --verify uses an ephemeral alpine container, not the base image; skip the
@@ -416,48 +463,9 @@ fi
 
 if ! $VERIFY; then
     if $RESET; then
-        # Before destroying the volume, scan /root/work for any uncommitted
-        # changes, unpushed commits, or stashes and prompt if found. Uses a
-        # throwaway container against the volume so it works identically in
-        # rootless and rootful modes — no host-side userns-path fiddling.
-        if "${PODMAN[@]}" volume inspect "$VOLUME_NAME" >/dev/null 2>&1 \
-           && "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-            echo "==> --reset: scanning /root/work for uncommitted/unpushed git state"
-            DIRTY_REPORT=$(
-                "${PODMAN[@]}" run --rm \
-                    --volume "$VOLUME_NAME:/root:ro" \
-                    "$IMAGE_NAME" \
-                    bash -c '
-set +e
-while IFS= read -r gitdir; do
-    repo=${gitdir%/.git}
-    cd "$repo" 2>/dev/null || continue
-    status=$(git status --porcelain 2>/dev/null)
-    unpushed=$(git rev-list --count --all --not --remotes 2>/dev/null || echo 0)
-    stashes=$(git stash list 2>/dev/null)
-    if [ -n "$status" ] || [ "${unpushed:-0}" -gt 0 ] || [ -n "$stashes" ]; then
-        echo "--- $repo ---"
-        [ -n "$status" ] && { echo "  working tree:"; echo "$status" | sed "s/^/    /"; }
-        [ "${unpushed:-0}" -gt 0 ] && echo "  unpushed commits: $unpushed (not reachable from any remote)"
-        [ -n "$stashes" ] && { echo "  stashes:"; echo "$stashes" | sed "s/^/    /"; }
-        echo
-    fi
-done < <(find /root/work -maxdepth 5 -type d -name .git 2>/dev/null)
-' 2>/dev/null
-            )
-            if [[ -n "$DIRTY_REPORT" ]]; then
-                echo
-                echo "$DIRTY_REPORT"
-                echo "The following state in /root/work would be lost on --reset."
-                read -r -p "Proceed anyway? [y/N] " REPLY
-                if [[ "$REPLY" != "y" && "$REPLY" != "Y" ]]; then
-                    echo "aborted"
-                    exit 1
-                fi
-            else
-                echo "    /root/work is clean"
-            fi
-        fi
+        # User confirmation for --reset (including the /root/work
+        # dirty-repo scan) happened up-front, right after pre-flight.
+        # By now we just do the actual destruction.
         echo "==> --reset: removing container $CONTAINER_NAME and wiping volume $VOLUME_NAME (mode=$MODE)"
         "${PODMAN[@]}" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
         "${PODMAN[@]}" volume rm -f "$VOLUME_NAME" >/dev/null 2>&1 || true
