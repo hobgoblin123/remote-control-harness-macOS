@@ -6,6 +6,17 @@ FROM ubuntu:24.04
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
+# Disable apt's _apt sandbox user. The running container drops all caps
+# (--cap-drop=ALL --security-opt=no-new-privileges), so apt can't setuid
+# to _apt at runtime — without this, `apt update` fails inside the
+# container. The sandbox only hardens against untrusted-repo fetcher
+# exploits; we run as root in the container regardless, so the threat
+# model is unchanged. We also chown the partial dirs (mode-700 _apt-owned
+# by default) to root, since --cap-drop=ALL strips CAP_DAC_OVERRIDE and
+# root can no longer bypass DAC on foreign-owned paths.
+RUN echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-no-sandbox \
+ && chown -R root:root /var/cache/apt /var/lib/apt
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \

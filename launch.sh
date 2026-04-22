@@ -369,6 +369,14 @@ PODMAN_ARGS=(
     --cpus=2
     --pids-limit=256
     --cap-drop=ALL
+    --cap-add=CHOWN
+    --cap-add=DAC_OVERRIDE
+    --cap-add=FOWNER
+    --cap-add=FSETID
+    --cap-add=SETFCAP
+    --cap-add=MKNOD
+    --cap-add=SETUID
+    --cap-add=SETGID
     --security-opt=no-new-privileges
     --volume "$VOLUME_NAME:/root"
     --volume "$DEPLOY_KEY_PATH:/tmp/deploy_key:ro"
