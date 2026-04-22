@@ -30,7 +30,10 @@ session (loginctl enable-linger <you> if not logged in).
                             for the podman invocation itself; volume/image
                             live in root's store, so the first --rootful
                             launch rebuilds both.
-  --reset                   wipe the persistent volume for the current mode
+  --reset                   remove the container and wipe the persistent
+                            volume for the current mode (forces a fresh
+                            create on next launch, picking up any config
+                            edits in this script)
   --rebuild-base            force rebuild of the base image from scratch
                             (passes --no-cache so every layer re-runs;
                             use this when a step's inputs changed
@@ -70,6 +73,9 @@ set +a
 : "${WEBAPP_CMD:?WEBAPP_CMD must be set}"
 : "${WEBAPP_PORT:?WEBAPP_PORT must be set}"
 : "${RC_PORT:?RC_PORT must be set}"
+
+MEM_LIMIT="${MEM_LIMIT:-8g}"
+CPU_LIMIT="${CPU_LIMIT:-8}"
 if ! $DISABLE_NETWORK_BLOCK; then
     : "${WHITELIST_HOSTS:?WHITELIST_HOSTS must be set}"
 fi
@@ -83,6 +89,17 @@ CANARY_BLOCKED_IP="${CANARY_BLOCKED_IP:-93.184.216.34}"
 if [[ ! -f "$DEPLOY_KEY_PATH" ]]; then
     echo "error: DEPLOY_KEY_PATH does not exist: $DEPLOY_KEY_PATH" >&2
     exit 1
+fi
+
+SHARED_DATA_PATH="${SHARED_DATA_PATH:-}"
+declare -a SHARED_DATA_VOLUME_ARGS=()
+if [[ -n "$SHARED_DATA_PATH" ]]; then
+    if [[ ! -d "$SHARED_DATA_PATH" ]]; then
+        echo "error: SHARED_DATA_PATH is not a directory: $SHARED_DATA_PATH" >&2
+        exit 1
+    fi
+    SHARED_DATA_PATH="$(cd "$SHARED_DATA_PATH" && pwd)"
+    SHARED_DATA_VOLUME_ARGS=(--volume "${SHARED_DATA_PATH}:/root/shared_data:ro")
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,6 +180,8 @@ if ! $DISABLE_NETWORK_BLOCK && ! sudo -n true 2>/dev/null; then
     echo "  ┌──────────────────────────────────────────────────────────────────┐"
     if [[ $MODE == rootless ]]; then
         echo "  │  sudo is required to install the host nftables egress filter.   │"
+        echo "  │  This is what prevents access to unknown IPs from within the    │"
+        echo "  │  container.                                                     │"
         echo "  │  The container itself will still run rootlessly — only the nft  │"
         echo "  │  table (which lives in the host network namespace) needs root.  │"
     else
@@ -183,6 +202,10 @@ if $VERIFY; then
 elif $REBUILD_BASE; then
     echo "==> rebuilding base image $IMAGE_NAME from scratch (mode=$MODE, --no-cache)"
     "${PODMAN[@]}" build --no-cache -t "$IMAGE_NAME" -f "$DOCKERFILE" "$SCRIPT_DIR"
+    if "${PODMAN[@]}" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+        echo "    note: container $CONTAINER_NAME still references the old image layers."
+        echo "    run --reset (or 'podman rm -f $CONTAINER_NAME') to create a fresh one from the rebuilt image."
+    fi
 elif ! "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     echo "==> building base image $IMAGE_NAME (mode=$MODE)"
     "${PODMAN[@]}" build -t "$IMAGE_NAME" -f "$DOCKERFILE" "$SCRIPT_DIR"
@@ -238,6 +261,10 @@ fi
 cleanup() {
     echo
     echo "==> tearing down ($MODE)"
+    # Stop the container but leave it (and its writable overlay) in place
+    # so runtime-installed packages, state under /var, /etc edits, etc.
+    # survive across launches. Use --reset to actually remove it.
+    "${PODMAN[@]}" stop -t 10 "$CONTAINER_NAME" >/dev/null 2>&1 || true
     if $DISABLE_NETWORK_BLOCK; then
         return
     fi
@@ -339,7 +366,50 @@ fi
 
 if ! $VERIFY; then
     if $RESET; then
-        echo "==> --reset: wiping volume $VOLUME_NAME (mode=$MODE)"
+        # Before destroying the volume, scan /root/work for any uncommitted
+        # changes, unpushed commits, or stashes and prompt if found. Uses a
+        # throwaway container against the volume so it works identically in
+        # rootless and rootful modes — no host-side userns-path fiddling.
+        if "${PODMAN[@]}" volume inspect "$VOLUME_NAME" >/dev/null 2>&1 \
+           && "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+            echo "==> --reset: scanning /root/work for uncommitted/unpushed git state"
+            DIRTY_REPORT=$(
+                "${PODMAN[@]}" run --rm \
+                    --volume "$VOLUME_NAME:/root:ro" \
+                    "$IMAGE_NAME" \
+                    bash -c '
+set +e
+while IFS= read -r gitdir; do
+    repo=${gitdir%/.git}
+    cd "$repo" 2>/dev/null || continue
+    status=$(git status --porcelain 2>/dev/null)
+    unpushed=$(git rev-list --count --all --not --remotes 2>/dev/null || echo 0)
+    stashes=$(git stash list 2>/dev/null)
+    if [ -n "$status" ] || [ "${unpushed:-0}" -gt 0 ] || [ -n "$stashes" ]; then
+        echo "--- $repo ---"
+        [ -n "$status" ] && { echo "  working tree:"; echo "$status" | sed "s/^/    /"; }
+        [ "${unpushed:-0}" -gt 0 ] && echo "  unpushed commits: $unpushed (not reachable from any remote)"
+        [ -n "$stashes" ] && { echo "  stashes:"; echo "$stashes" | sed "s/^/    /"; }
+        echo
+    fi
+done < <(find /root/work -maxdepth 5 -type d -name .git 2>/dev/null)
+' 2>/dev/null
+            )
+            if [[ -n "$DIRTY_REPORT" ]]; then
+                echo
+                echo "$DIRTY_REPORT"
+                echo "The following state in /root/work would be lost on --reset."
+                read -r -p "Proceed anyway? [y/N] " REPLY
+                if [[ "$REPLY" != "y" && "$REPLY" != "Y" ]]; then
+                    echo "aborted"
+                    exit 1
+                fi
+            else
+                echo "    /root/work is clean"
+            fi
+        fi
+        echo "==> --reset: removing container $CONTAINER_NAME and wiping volume $VOLUME_NAME (mode=$MODE)"
+        "${PODMAN[@]}" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
         "${PODMAN[@]}" volume rm -f "$VOLUME_NAME" >/dev/null 2>&1 || true
     fi
     if ! "${PODMAN[@]}" volume inspect "$VOLUME_NAME" >/dev/null 2>&1; then
@@ -348,6 +418,17 @@ if ! $VERIFY; then
     else
         echo "==> reusing volume $VOLUME_NAME"
     fi
+fi
+
+# Containers persist across launches (no --rm): the writable overlay
+# keeps runtime-installed apt packages, service state, and /etc edits.
+# podman run flags (caps, volumes, env, publish ports, memory, cpus) are
+# frozen at create time, so to pick up config changes you need to remove
+# the container (`podman rm -f $CONTAINER_NAME`, or use --reset which
+# also wipes the volume).
+CONTAINER_EXISTS=false
+if ! $VERIFY && "${PODMAN[@]}" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    CONTAINER_EXISTS=true
 fi
 
 # ---- launch ----------------------------------------------------------------
@@ -359,14 +440,17 @@ echo "    webapp:  $WEBAPP_CMD (port $WEBAPP_PORT)"
 echo "    rc:      port $RC_PORT"
 echo
 
-# Shared podman args
+# Shared podman args. No --rm: the container persists across launches
+# (see container-existence check above). First launch uses `podman run`
+# with this full arg list; subsequent launches use `podman start -ai` on
+# the existing container.
 PODMAN_ARGS=(
-    run --rm -it
+    run -it
     --name "$CONTAINER_NAME"
     --hostname remote-code
     "${ADD_HOST_ARGS[@]}"
-    --memory=4g
-    --cpus=2
+    --memory="$MEM_LIMIT"
+    --cpus="$CPU_LIMIT"
     --pids-limit=256
     --cap-drop=ALL
     --cap-add=CHOWN
@@ -381,6 +465,7 @@ PODMAN_ARGS=(
     --volume "$VOLUME_NAME:/root"
     --volume "$DEPLOY_KEY_PATH:/tmp/deploy_key:ro"
     --volume "$SETUP_SCRIPT:/setup.sh:ro"
+    "${SHARED_DATA_VOLUME_ARGS[@]}"
     --env "PROJECT_NAME=$PROJECT_NAME"
     --env "REPO_URL=$REPO_URL"
     --env "WEBAPP_CMD=$WEBAPP_CMD"
@@ -414,26 +499,32 @@ if [[ $MODE == rootless ]]; then
         exit 0
     fi
 
-    if $DISABLE_NETWORK_BLOCK; then
-        # No slice / nft filter: run podman directly on pasta, no egress
-        # restrictions.
-        podman "${PODMAN_ARGS[@]}" \
-            --network=pasta \
-            "$IMAGE_NAME" \
-            /bin/bash /setup.sh
+    # Build the podman invocation: `start -ai` for an existing container,
+    # full `run ...` args for a fresh create. podman run flags are frozen
+    # at create time, so `start` doesn't re-apply them.
+    if $CONTAINER_EXISTS; then
+        echo "==> reusing existing container $CONTAINER_NAME (use --reset to recreate)"
+        PODMAN_CMD=(podman start -ai "$CONTAINER_NAME")
     else
-        systemd-run --user --scope --quiet --slice="$SLICE_NAME" -- \
-            podman "${PODMAN_ARGS[@]}" \
-            --network=pasta \
-            "$IMAGE_NAME" \
-            /bin/bash /setup.sh
+        echo "==> creating new container $CONTAINER_NAME"
+        PODMAN_CMD=(podman "${PODMAN_ARGS[@]}" --network=pasta "$IMAGE_NAME" /bin/bash /setup.sh)
+    fi
+
+    if $DISABLE_NETWORK_BLOCK; then
+        "${PODMAN_CMD[@]}"
+    else
+        systemd-run --user --scope --quiet --slice="$SLICE_NAME" -- "${PODMAN_CMD[@]}"
     fi
 else
     if $VERIFY; then
         echo "error: --verify is only implemented for rootless mode" >&2
         exit 1
     fi
-    if $DISABLE_NETWORK_BLOCK; then
+
+    if $CONTAINER_EXISTS; then
+        echo "==> reusing existing container $CONTAINER_NAME (use --reset to recreate)"
+        sudo podman start -ai "$CONTAINER_NAME"
+    elif $DISABLE_NETWORK_BLOCK; then
         # No custom bridge / iptables filter: fall back to podman's default
         # network. All outbound traffic is permitted.
         sudo podman "${PODMAN_ARGS[@]}" \
