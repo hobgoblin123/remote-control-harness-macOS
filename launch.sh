@@ -8,6 +8,7 @@ RESET=false
 REBUILD_BASE=false
 VERIFY=false
 DISABLE_NETWORK_BLOCK=false
+UPDATE=false
 ENV_FILE=".env"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -16,10 +17,11 @@ while [[ $# -gt 0 ]]; do
         --rebuild-base)           REBUILD_BASE=true; shift ;;
         --verify)                 VERIFY=true; shift ;;
         --disable-network-block)  DISABLE_NETWORK_BLOCK=true; shift ;;
+        --update)                 UPDATE=true; shift ;;
         -h|--help)
             cat <<EOF
 usage: $0 [--rootful] [--reset] [--rebuild-base] [--verify]
-          [--disable-network-block] [env-file]
+          [--disable-network-block] [--update] [env-file]
 
 default mode: rootless podman + --network=pasta + nftables cgroup-v2 match
 on OUTPUT for egress filtering. prereqs: pasta, nftables, systemd --user
@@ -43,6 +45,13 @@ session (loginctl enable-linger <you> if not logged in).
                             skips nft/iptables setup and the WHITELIST_HOSTS
                             allowlist; all outbound traffic is permitted.
                             mutually exclusive with --verify.
+  --update                  run in-container refresh (apt upgrade, mise
+                            upgrade, claude code update, lazyvim plugin
+                            sync) against the currently-running container.
+                            requires a container already running from a
+                            prior ./launch.sh in another terminal.
+                            mutually exclusive with --reset, --rebuild-base,
+                            --verify.
   env-file                  path to env file (default: .env)
 EOF
             exit 0
@@ -54,6 +63,11 @@ done
 
 if $VERIFY && $DISABLE_NETWORK_BLOCK; then
     echo "error: --verify and --disable-network-block are mutually exclusive." >&2
+    exit 1
+fi
+
+if $UPDATE && ( $RESET || $REBUILD_BASE || $VERIFY ); then
+    echo "error: --update is mutually exclusive with --reset, --rebuild-base, --verify." >&2
     exit 1
 fi
 
@@ -140,6 +154,42 @@ if [[ $MODE == rootful ]]; then
     PODMAN=(sudo podman)
 else
     PODMAN=(podman)
+fi
+
+# ---- --update: in-container refresh against running container --------------
+# Must bail before pre-flight + network-filter install; otherwise we'd
+# rebuild the nft table on top of the one held open by the launch that's
+# currently owning the container, wiping its egress rules.
+if $UPDATE; then
+    if ! "${PODMAN[@]}" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+        echo "error: container $CONTAINER_NAME does not exist. run './launch.sh' first." >&2
+        exit 1
+    fi
+    if ! "${PODMAN[@]}" container inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -qi true; then
+        echo "error: container $CONTAINER_NAME is not running." >&2
+        echo "       launch it in another terminal via './launch.sh' first, so the egress filter stays up." >&2
+        exit 1
+    fi
+    echo "==> --update: refreshing packages inside $CONTAINER_NAME"
+    "${PODMAN[@]}" exec "$CONTAINER_NAME" bash -c '
+set -e
+export DEBIAN_FRONTEND=noninteractive
+echo "--- apt upgrade"
+apt-get update
+apt-get -y upgrade
+echo "--- mise: self-update + upgrade managed tools"
+mise self-update -y || true
+mise upgrade
+echo "--- claude code (global pnpm)"
+pnpm update -g @anthropic-ai/claude-code
+# pnpm v10 blocks global postinstall; re-run claude-code install.cjs manually,
+# same dance as the Dockerfile does on first install.
+node "$(pnpm root -g)/@anthropic-ai/claude-code/install.cjs"
+echo "--- lazyvim plugin sync"
+nvim --headless "+Lazy! sync" +qa
+echo "--- done"
+'
+    exit 0
 fi
 
 # ---- pre-flight ------------------------------------------------------------
