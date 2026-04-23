@@ -30,6 +30,7 @@ RUN apt-get update \
       build-essential \
       sudo \
       iproute2 \
+      netcat-openbsd \
  && rm -rf /var/lib/apt/lists/*
 
 # Neovim from the official prebuilt tarball — Ubuntu 24.04's apt nvim (0.9.5)
@@ -91,3 +92,11 @@ RUN printf '%s\n' \
     'eval "$(/root/.local/bin/mise activate bash)"' \
     '# --- end remote-code-harness ---' \
     >> /root/.bashrc
+
+# Seed /root/.claude with a default settings.json wiring Claude's Stop
+# and Notification hooks to the host-side rc-notify UDS that launch.sh
+# mounts at /run/notify.sock. /root is seeded into the persistent
+# volume on first launch, so these files survive across restarts (edit
+# at will; --reset re-seeds).
+COPY container/claude/ /root/.claude/
+RUN chmod +x /root/.claude/test_notify.sh

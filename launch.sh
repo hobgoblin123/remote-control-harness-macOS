@@ -120,6 +120,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_SCRIPT="$SCRIPT_DIR/setup.sh"
 DOCKERFILE="$SCRIPT_DIR/Dockerfile"
+NOTIFY_LISTENER="$SCRIPT_DIR/host_listener.py"
+NOTIFY_SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID}/rc-notify.sock"
 [[ -f "$SETUP_SCRIPT" ]] || { echo "error: setup.sh not found at $SETUP_SCRIPT" >&2; exit 1; }
 [[ -f "$DOCKERFILE"    ]] || { echo "error: Dockerfile not found at $DOCKERFILE" >&2; exit 1; }
 
@@ -460,6 +462,40 @@ else
     echo "==> installed iptables egress filter: chain $CHAIN_NAME, ${#ALLOWED_IPS[@]} allowed IPs"
 fi
 
+# ---- host-side notification listener --------------------------------------
+# Start a persistent UDS listener as a systemd user service so a
+# compromised container can only signal a whitelisted event (done /
+# waiting) — never render arbitrary notification text under the
+# "Claude Code" brand. The listener persists across launches
+# (intentional: single global listener shared by any project's
+# container). Stop it manually via
+# `systemctl --user stop rc-notify.service` when you want it gone.
+if ! $VERIFY; then
+    if systemctl --user is-active --quiet rc-notify.service 2>/dev/null; then
+        echo "==> rc-notify listener already running"
+    elif [[ -f "$NOTIFY_LISTENER" ]] && command -v systemd-run >/dev/null 2>&1; then
+        echo "==> starting rc-notify listener on $NOTIFY_SOCK"
+        systemctl --user reset-failed rc-notify.service 2>/dev/null || true
+        systemctl --user stop rc-notify.service 2>/dev/null || true
+        systemd-run --user --quiet \
+            --unit=rc-notify.service \
+            --description="remote-code-harness notification listener" \
+            python3 "$NOTIFY_LISTENER"
+        # Wait briefly for the socket to bind.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [[ -S "$NOTIFY_SOCK" ]] && break
+            sleep 0.1
+        done
+    fi
+fi
+
+declare -a NOTIFY_VOLUME_ARGS=()
+if [[ -S "$NOTIFY_SOCK" ]]; then
+    NOTIFY_VOLUME_ARGS=(--volume "$NOTIFY_SOCK:/run/notify.sock")
+else
+    echo "    warn: rc-notify socket not present at $NOTIFY_SOCK — container hooks will fail silently"
+fi
+
 # ---- persistent volume -----------------------------------------------------
 
 if ! $VERIFY; then
@@ -525,6 +561,7 @@ PODMAN_ARGS=(
     --volume "$DEPLOY_KEY_PATH:/tmp/deploy_key:ro"
     --volume "$SETUP_SCRIPT:/setup.sh:ro"
     "${SHARED_DATA_VOLUME_ARGS[@]}"
+    "${NOTIFY_VOLUME_ARGS[@]}"
     --env "PROJECT_NAME=$PROJECT_NAME"
     --env "REPO_URL=$REPO_URL"
     --env "WEBAPP_CMD=$WEBAPP_CMD"

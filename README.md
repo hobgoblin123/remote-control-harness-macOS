@@ -22,6 +22,7 @@
 - Claude Code pre-installed (along with NodeJS and pnpm that Claude Code needs)
 - Optionally, it can mount a directory on host that you can configure as a read-only mount
 - When doing teardown, it checks git directories for any uncommitted files/commits before taking it down
+- Dev container to host notification via Unix domain socket comes built in
 
 ## Prerequisites
 
