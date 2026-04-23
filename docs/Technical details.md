@@ -24,9 +24,9 @@ You run `./launch.sh` on a host machine, and you end up with:
 
 Container posture: `--cap-drop=ALL` with a narrow allowlist added back
 (see [Container capabilities](#container-capabilities)),
-`no-new-privileges`, 8G RAM / 8 CPU / 256 pids cap (RAM and CPU override
-via `MEM_LIMIT` / `CPU_LIMIT` in `.env`). The deploy key is mounted
-read-only and scoped to the one repo by whoever issued it.
+`no-new-privileges`, 8G RAM / 8 CPU / 16384 pids cap (override via
+`MEM_LIMIT` / `CPU_LIMIT` / `PIDS_LIMIT` in `.env`). The deploy key is
+mounted read-only and scoped to the one repo by whoever issued it.
 
 ## Container capabilities
 

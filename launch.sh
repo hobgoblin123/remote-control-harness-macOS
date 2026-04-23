@@ -90,6 +90,7 @@ set +a
 
 MEM_LIMIT="${MEM_LIMIT:-8g}"
 CPU_LIMIT="${CPU_LIMIT:-8}"
+PIDS_LIMIT="${PIDS_LIMIT:-16384}"
 if ! $DISABLE_NETWORK_BLOCK; then
     : "${WHITELIST_HOSTS:?WHITELIST_HOSTS must be set}"
 fi
@@ -509,7 +510,7 @@ PODMAN_ARGS=(
     "${ADD_HOST_ARGS[@]}"
     --memory="$MEM_LIMIT"
     --cpus="$CPU_LIMIT"
-    --pids-limit=256
+    --pids-limit="$PIDS_LIMIT"
     --cap-drop=ALL
     --cap-add=CHOWN
     --cap-add=DAC_OVERRIDE

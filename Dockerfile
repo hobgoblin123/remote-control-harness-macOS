@@ -28,6 +28,8 @@ RUN apt-get update \
       fd-find \
       unzip \
       build-essential \
+      sudo \
+      iproute2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Neovim from the official prebuilt tarball — Ubuntu 24.04's apt nvim (0.9.5)
