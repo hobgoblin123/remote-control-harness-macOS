@@ -167,7 +167,7 @@ another launch is holding open.
   is still the path. Container overlays are bound to their base layers
   and can't be rebased in place.
 - It doesn't update image-level non-apt content: the nvim binary at
-  `/opt/nvim-linux-x86_64`, the tree-sitter CLI at
+  `/opt/nvim-linux-{x86_64,arm64}`, the tree-sitter CLI at
   `/usr/local/bin/tree-sitter`, or the LazyVim starter config seeded at
   image build. These drift until `--rebuild-base` + `--reset`.
 - It won't recover a broken state. If an `apt upgrade` half-completes,

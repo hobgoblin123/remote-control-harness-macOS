@@ -37,9 +37,15 @@ RUN apt-get update \
 # is older than what current LazyVim requires. `stable` is a moving tag that
 # points at the latest stable release; pin if you need reproducibility across
 # base-image rebuilds.
-RUN curl -fsSL "https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz" \
+RUN set -eu; arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  nvim_arch=x86_64 ;; \
+      aarch64) nvim_arch=arm64  ;; \
+      *) echo "unsupported arch for neovim: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/neovim/neovim/releases/download/stable/nvim-linux-${nvim_arch}.tar.gz" \
       | tar -xz -C /opt \
- && ln -s /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
+ && ln -s "/opt/nvim-linux-${nvim_arch}/bin/nvim" /usr/local/bin/nvim
 
 # Install mise under /root/.local so it lands inside the project's persistent
 # volume on first launch (podman initializes empty named volumes from the
@@ -65,7 +71,13 @@ RUN mkdir -p "$PNPM_HOME" \
 # the "Ignored build scripts" warning because the npm package's only job is a
 # postinstall that downloads this same binary from GitHub releases — and pnpm
 # v10 blocks postinstall on global installs. Skip the middleman.
-RUN curl -fsSL "https://github.com/tree-sitter/tree-sitter/releases/latest/download/tree-sitter-linux-x64.gz" \
+RUN set -eu; arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  ts_arch=x64   ;; \
+      aarch64) ts_arch=arm64 ;; \
+      *) echo "unsupported arch for tree-sitter: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/tree-sitter/tree-sitter/releases/latest/download/tree-sitter-linux-${ts_arch}.gz" \
       | gunzip > /usr/local/bin/tree-sitter \
  && chmod +x /usr/local/bin/tree-sitter
 
