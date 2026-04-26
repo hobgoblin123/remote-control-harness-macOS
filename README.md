@@ -74,3 +74,7 @@ it does not destroy data in the other mode's store.
 - [Connecting from your phone](docs/How%20to%20connect%20to%20container.md#connecting-from-your-phone) — tunneling the 127.0.0.1-bound ports.
 - [Connecting from VSCode](docs/How%20to%20connect%20to%20container.md#connecting-from-vscode) — Dev Containers extension + the podman socket.
 - [Claude remote-control](docs/How%20to%20connect%20to%20container.md#claude-remote-control) — attaching to the tmux session, pairing, log tail.
+
+### [Running on a remote host](docs/Running%20on%20a%20remote%20host.md)
+
+- Launching the harness on a remote Linux box (Hetzner/AWS/DO, x86_64 or aarch64) and attaching to it from your laptop's VSCode over SSH.
