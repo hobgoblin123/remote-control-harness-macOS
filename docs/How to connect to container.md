@@ -62,7 +62,9 @@ tmux session named `remote-control` on container boot. Two ways to see
 what it's doing:
 
 ```bash
-# Attach to the live tmux session (Ctrl-b d to detach without killing it)
+# Attach to the live tmux session (Ctrl-a d to detach without killing it;
+# the container's tmux prefix is remapped from C-b to C-a so it doesn't
+# collide with a host-side tmux you're attaching through)
 podman exec -it remote-code-<project> tmux attach -t remote-control
 
 # Or just tail the mirrored log

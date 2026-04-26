@@ -95,6 +95,16 @@ RUN git clone --depth 1 https://github.com/LazyVim/starter /root/.config/nvim \
       "+TSInstallSync bash c diff html javascript jsdoc json jsonc lua luadoc markdown markdown_inline python query regex toml tsx typescript vim vimdoc xml yaml" \
       +qa
 
+# Remap tmux prefix from C-b to C-a so it doesn't collide with a host-side
+# tmux when attaching from a local tmux pane. Written to /etc/tmux.conf so
+# the change survives across persistent-volume reuse (a /root/.tmux.conf
+# would only seed on first launch / --reset).
+RUN printf '%s\n' \
+    'unbind C-b' \
+    'set -g prefix C-a' \
+    'bind C-a send-prefix' \
+    > /etc/tmux.conf
+
 # Interactive shells inside the container should get mise + pnpm on PATH.
 RUN printf '%s\n' \
     '# --- remote-code-harness ---' \
