@@ -16,6 +16,7 @@ set -euo pipefail
 # It never affects container behaviour (the container is always Linux);
 # it only controls which host-side instructions are printed at the end.
 HOST_OS="${HOST_OS:-linux}"
+EXPOSE_WEBAPP="${EXPOSE_WEBAPP:-false}"
 
 WORKDIR="/root/work/${PROJECT_NAME}"
 
@@ -109,6 +110,16 @@ tmux pipe-pane -t devserver -o 'cat >>/root/.logs/devserver.log'
 echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t devserver"
 echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/devserver.log"
 
+if [[ "$EXPOSE_WEBAPP" == "true" ]]; then
+    log "starting cloudflared quick tunnel in tmux session 'tunnel' (-> port $WEBAPP_PORT)"
+    : > /root/.logs/tunnel.log
+    rm -f /root/.logs/tunnel-url.txt
+    tmux new-session -d -s tunnel "cloudflared tunnel --url http://localhost:$WEBAPP_PORT 2>&1; echo '[cloudflared exited]'; exec bash"
+    tmux pipe-pane -t tunnel -o 'cat >>/root/.logs/tunnel.log'
+    echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t tunnel"
+    echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/tunnel.log"
+fi
+
 log "starting claude remote-control in tmux session 'remote-control'"
 tmux new-session -d -s remote-control 'claude remote-control; echo "[claude remote-control exited]"; exec bash'
 tmux pipe-pane -t remote-control -o 'cat >>/root/.logs/remote-control.log'
@@ -131,6 +142,52 @@ else
      see the container:
        systemctl --user enable --now podman.socket     # rootless mode
        sudo systemctl enable --now podman.socket       # --rootful mode"
+fi
+
+TUNNEL_BANNER=""
+if [[ "$EXPOSE_WEBAPP" == "true" ]]; then
+    log "waiting for cloudflared tunnel URL (up to 30s)"
+    TUNNEL_URL=""
+    for _ in $(seq 1 60); do
+        TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /root/.logs/tunnel.log 2>/dev/null | head -1 || true)
+        [[ -n "$TUNNEL_URL" ]] && break
+        sleep 0.5
+    done
+    if [[ -n "$TUNNEL_URL" ]]; then
+        echo "$TUNNEL_URL" > /root/.logs/tunnel-url.txt
+        TUNNEL_BANNER=$(cat <<TBEOF
+
+============================================================
+  PUBLIC TUNNEL ACTIVE — webapp exposed to the internet
+============================================================
+
+  $TUNNEL_URL
+
+  Anyone with this URL can reach your webapp; the URL is the
+  only access control. Stable until the next ./launch.sh.
+  Cached at /root/.logs/tunnel-url.txt inside the container.
+
+  attach: podman exec -it $CNAME tmux attach -t tunnel
+  log:    podman exec -it $CNAME tail -f /root/.logs/tunnel.log
+
+============================================================
+TBEOF
+)
+    else
+        TUNNEL_BANNER=$(cat <<TBEOF
+
+============================================================
+  PUBLIC TUNNEL — URL not detected after 30s
+============================================================
+
+  Check the tunnel session:
+    podman exec -it $CNAME tmux attach -t tunnel
+    podman exec -it $CNAME tail -f /root/.logs/tunnel.log
+
+============================================================
+TBEOF
+)
+    fi
 fi
 
 cat <<EOF
@@ -176,6 +233,7 @@ To stop the container:
   or: press Ctrl+C / Ctrl+D in this terminal
 
 ============================================================
+$TUNNEL_BANNER
 
 EOF
 
