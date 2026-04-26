@@ -688,6 +688,7 @@ PODMAN_ARGS=(
     --env "RC_PORT=$RC_PORT"
     --env "CANARY_BLOCKED_IP=$CANARY_BLOCKED_IP"
     --env "HOST_OS=$OS"
+    --env "DISABLE_NETWORK_BLOCK=$DISABLE_NETWORK_BLOCK"
     --publish "127.0.0.1:${WEBAPP_PORT}:${WEBAPP_PORT}"
     --publish "127.0.0.1:${RC_PORT}:${RC_PORT}"
 )

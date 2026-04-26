@@ -38,6 +38,8 @@ eval "$(/root/.local/bin/mise activate bash)"
 #
 # nft `drop` silently discards packets, so a working filter appears as a
 # connect timeout rather than a TCP reset. 3s is enough.
+DISABLE_NETWORK_BLOCK="${DISABLE_NETWORK_BLOCK:-false}"
+
 GIT_HOST="$(echo "$REPO_URL" | sed -E 's#^(git@|ssh://git@|https://)##; s#[:/].*$##')"
 # Extract an explicit SSH port from ssh:// URLs (defaults to 22). Useful when an
 # ISP or firewall blocks port 22 — in that case set REPO_URL to something like
@@ -45,9 +47,13 @@ GIT_HOST="$(echo "$REPO_URL" | sed -E 's#^(git@|ssh://git@|https://)##; s#[:/].*
 # keyscan on the right port.
 GIT_SSH_PORT="$(echo "$REPO_URL" | sed -nE 's#^ssh://git@[^:/]+:([0-9]+)/.*#\1#p')"
 GIT_SSH_PORT="${GIT_SSH_PORT:-22}"
-log "egress self-check (block: $CANARY_BLOCKED_IP, allow: $GIT_HOST:$GIT_SSH_PORT)"
-if timeout 3 bash -c "echo > /dev/tcp/${CANARY_BLOCKED_IP}/80" 2>/dev/null; then
-    cat >&2 <<EOF
+
+if [[ "$DISABLE_NETWORK_BLOCK" == "true" ]]; then
+    log "egress self-check skipped (--disable-network-block)"
+else
+    log "egress self-check (block: $CANARY_BLOCKED_IP, allow: $GIT_HOST:$GIT_SSH_PORT)"
+    if timeout 3 bash -c "echo > /dev/tcp/${CANARY_BLOCKED_IP}/80" 2>/dev/null; then
+        cat >&2 <<EOF
 
 FATAL: egress filter is NOT enforcing.
   ${CANARY_BLOCKED_IP} was reachable on TCP/80, but it is not in the
@@ -60,20 +66,21 @@ FATAL: egress filter is NOT enforcing.
     Linux rootful:   sudo iptables -nvL REMOTE-CODE-<project-slug>
     macOS:           podman machine ssh -- sudo nft list table inet rcode_\${PROJECT_NAME//-/_}
 EOF
-    exit 1
-fi
-if ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/${GIT_SSH_PORT}" 2>/dev/null \
-   && ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/443" 2>/dev/null; then
-    cat >&2 <<EOF
+        exit 1
+    fi
+    if ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/${GIT_SSH_PORT}" 2>/dev/null \
+       && ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/443" 2>/dev/null; then
+        cat >&2 <<EOF
 
 FATAL: allowlisted host ${GIT_HOST} is unreachable on ${GIT_SSH_PORT} or 443.
   Either the allowlist is misconfigured (is ${GIT_HOST} in WHITELIST_HOSTS
   or resolved via GIT_HOST auto-add?) or host networking is down. Aborting
   before the repo clone.
 EOF
-    exit 1
+        exit 1
+    fi
+    echo "  ok: egress filter enforcing (${CANARY_BLOCKED_IP} dropped, ${GIT_HOST}:${GIT_SSH_PORT} reachable)"
 fi
-echo "  ok: egress filter enforcing (${CANARY_BLOCKED_IP} dropped, ${GIT_HOST}:${GIT_SSH_PORT} reachable)"
 
 log "installing deploy key"
 mkdir -p /root/.ssh
