@@ -13,6 +13,7 @@ set -euo pipefail
 : "${CANARY_BLOCKED_IP:?}"
 
 EXPOSE_WEBAPP="${EXPOSE_WEBAPP:-false}"
+DISABLE_NETWORK_BLOCK="${DISABLE_NETWORK_BLOCK:-false}"
 
 WORKDIR="/root/work/${PROJECT_NAME}"
 
@@ -37,9 +38,12 @@ eval "$(/root/.local/bin/mise activate bash)"
 # nft `drop` action silently discards packets, so a working filter shows up
 # as a connect timeout rather than a TCP reset. 3s is enough.
 GIT_HOST="$(echo "$REPO_URL" | sed -E 's#^(git@|ssh://git@|https://)##; s#[:/].*$##')"
-log "egress self-check (block: $CANARY_BLOCKED_IP, allow: $GIT_HOST)"
-if timeout 3 bash -c "echo > /dev/tcp/${CANARY_BLOCKED_IP}/80" 2>/dev/null; then
-    cat >&2 <<EOF
+if [[ "$DISABLE_NETWORK_BLOCK" == "true" ]]; then
+    log "egress self-check skipped (--disable-network-block: no filter installed on host)"
+else
+    log "egress self-check (block: $CANARY_BLOCKED_IP, allow: $GIT_HOST)"
+    if timeout 3 bash -c "echo > /dev/tcp/${CANARY_BLOCKED_IP}/80" 2>/dev/null; then
+        cat >&2 <<EOF
 
 FATAL: egress filter is NOT enforcing.
   ${CANARY_BLOCKED_IP} was reachable on TCP/80, but it is not in the
@@ -51,20 +55,21 @@ FATAL: egress filter is NOT enforcing.
     mode=rootless: sudo nft list table inet rcode_\${PROJECT_NAME//-/_}
     mode=rootful : sudo iptables -nvL REMOTE-CODE-\${PROJECT_NAME-slug}
 EOF
-    exit 1
-fi
-if ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/22" 2>/dev/null \
-   && ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/443" 2>/dev/null; then
-    cat >&2 <<EOF
+        exit 1
+    fi
+    if ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/22" 2>/dev/null \
+       && ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/443" 2>/dev/null; then
+        cat >&2 <<EOF
 
 FATAL: allowlisted host ${GIT_HOST} is unreachable on 22 or 443.
   Either the allowlist is misconfigured (is ${GIT_HOST} in WHITELIST_HOSTS
   or resolved via GIT_HOST auto-add?) or host networking is down. Aborting
   before the repo clone.
 EOF
-    exit 1
+        exit 1
+    fi
+    echo "  ok: egress filter enforcing (${CANARY_BLOCKED_IP} dropped, ${GIT_HOST} reachable)"
 fi
-echo "  ok: egress filter enforcing (${CANARY_BLOCKED_IP} dropped, ${GIT_HOST} reachable)"
 
 log "installing deploy key"
 mkdir -p /root/.ssh
