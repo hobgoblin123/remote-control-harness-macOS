@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Host-side notifier: plays notification_sound.wav and shows a persistent
-# libnotify notification. Meant to be invoked by the host-side listener
-# when the container signals a notification event (see the UDS plumbing
-# added separately).
+# Host-side notifier: plays notification_sound.wav and shows a desktop
+# notification. Invoked by the host-side listener when the container signals
+# a notification event via the UDS.
+#
+# Supports Linux (libnotify + PulseAudio/PipeWire/ALSA) and macOS
+# (osascript + afplay). On macOS, osascript's display notification does not
+# require any extra packages and respects Do Not Disturb settings.
 #
 # Arg 1 is an event-type keyword that maps to a preset body; anything
-# else is treated as a literal body. Arg 2 optionally overrides the
-# title (defaults to "Claude Code", which groups well in notification
-# centers).
+# else is rejected. Arg 2 optionally overrides the title.
 #
 # Standalone test:
 #   ./host_notify.sh                         # "Task complete"
@@ -22,25 +23,45 @@ SOUND_FILE="${SOUND_FILE:-$SCRIPT_DIR/notification_sound.wav}"
 EVENT="${1:-done}"
 TITLE="Claude Code"
 
-# Whitelist of valid events. Refuse to display arbitrary body text
-# because the notification appears under the trusted "Claude Code"
-# brand with critical urgency — an attacker-controlled process in the
-# container (compromised dep, rogue agent) could otherwise spoof
-# convincing prompts like "Task complete — paste the command I sent" or
-# inject pango markup on daemons that render it. Add new events here
-# explicitly as the need arises; the upstream listener daemon should
-# reject unknown events too, but this is cheap defence-in-depth.
+# Whitelist of valid events. Refuse to display arbitrary body text because
+# the notification appears under the trusted "Claude Code" brand —
+# a compromised process in the container could otherwise spoof prompts.
+# The upstream listener daemon also rejects unknown events; this is
+# cheap defence-in-depth.
 case "$EVENT" in
     done)       BODY="Task complete" ;;
     waiting)    BODY="Awaiting your input" ;;
     *)          echo "host_notify: unknown event '$EVENT'" >&2; exit 2 ;;
 esac
 
-# Play the sound in the background so the notification pops immediately
-# and the script doesn't block on audio playback. Try the common players
-# in order: paplay handles PulseAudio and PipeWire (via pipewire-pulse)
-# on modern desktops; pw-play is native PipeWire; aplay is bare ALSA;
-# ffplay is a last-ditch fallback.
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # Audio: afplay is built into macOS (no install required).
+    if [[ -r "$SOUND_FILE" ]]; then
+        afplay "$SOUND_FILE" &
+        disown 2>/dev/null || true
+    fi
+
+    # Notification: osascript is always available on macOS. The 'display
+    # notification' command routes through Notification Centre and respects
+    # per-app and focus/DND settings. We do not force critical urgency here
+    # because macOS manages that at the system level.
+    osascript -e "display notification \"$BODY\" with title \"$TITLE\"" 2>/dev/null || {
+        # Fallback if osascript is somehow unavailable.
+        echo "$TITLE: $BODY" >&2
+    }
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Linux
+# ---------------------------------------------------------------------------
+
+# Play the sound in the background so the notification pops immediately.
+# Try common players in order: paplay (PulseAudio/PipeWire), pw-play
+# (native PipeWire), aplay (bare ALSA), ffplay (last-ditch fallback).
 play_sound() {
     if [[ ! -r "$SOUND_FILE" ]]; then
         echo "notify: sound file not readable at $SOUND_FILE" >&2
@@ -61,11 +82,9 @@ play_sound() {
     disown 2>/dev/null || true
 }
 
-# --urgency=critical + --expire-time=0 = "persistent until dismissed" on
-# every freedesktop-compliant notification daemon (GNOME Shell, KDE
-# Plasma, dunst, mako, xfce4-notifyd, ...). Note: critical notifications
-# typically bypass Do Not Disturb, which is usually what you want for
-# "Claude is awaiting input" but worth knowing.
+# --urgency=critical + --expire-time=0 = persistent until dismissed on every
+# freedesktop-compliant notification daemon (GNOME Shell, KDE Plasma, dunst,
+# mako, xfce4-notifyd, ...). Critical notifications typically bypass DND.
 show_notification() {
     if ! command -v notify-send >/dev/null 2>&1; then
         echo "notify: notify-send not installed (try 'apt install libnotify-bin')" >&2

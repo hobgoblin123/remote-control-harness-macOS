@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ---- OS detection ----------------------------------------------------------
+# Detected once here; used throughout to gate macOS-specific paths.
+# Linux behaviour is preserved exactly; macOS paths are purely additive.
+OS="linux"
+[[ "$(uname -s)" == "Darwin" ]] && OS="macos"
+
 # ---- arg parsing -----------------------------------------------------------
 
 MODE=rootless
@@ -12,46 +18,48 @@ UPDATE=false
 ENV_FILE=".env"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rootful)                MODE=rootful; shift ;;
+        --rootful)
+            if [[ $OS == "macos" ]]; then
+                echo "error: --rootful is not supported on macOS." >&2
+                echo "       The podman machine VM already provides equivalent isolation." >&2
+                echo "       Run without --rootful (rootless is the only mode on macOS)." >&2
+                exit 1
+            fi
+            MODE=rootful; shift ;;
         --reset)                  RESET=true; shift ;;
         --rebuild-base)           REBUILD_BASE=true; shift ;;
         --verify)                 VERIFY=true; shift ;;
         --disable-network-block)  DISABLE_NETWORK_BLOCK=true; shift ;;
         --update)                 UPDATE=true; shift ;;
         -h|--help)
-            cat <<EOF
+            cat <<'EOF'
 usage: $0 [--rootful] [--reset] [--rebuild-base] [--verify]
           [--disable-network-block] [--update] [env-file]
 
-default mode: rootless podman + --network=pasta + nftables cgroup-v2 match
-on OUTPUT for egress filtering. prereqs: pasta, nftables, systemd --user
+Linux default mode: rootless podman + --network=pasta + nftables cgroup-v2
+match on OUTPUT for egress filtering. prereqs: pasta, nftables, systemd --user
 session (loginctl enable-linger <you> if not logged in).
 
-  --rootful                 fallback to rootful podman + netavark bridge +
-                            iptables FORWARD egress filter. requires sudo
-                            for the podman invocation itself; volume/image
-                            live in root's store, so the first --rootful
-                            launch rebuilds both.
+macOS mode: rootless podman (via podman machine / Apple VZ) + bridge network
+inside the VM + nftables FORWARD filter installed in the VM via
+'podman machine ssh'. No host-level firewall changes are made on macOS.
+prereqs: podman (brew install podman), a running podman machine
+(podman machine init && podman machine start).
+
+  --rootful                 (Linux only) fallback to rootful podman + netavark
+                            bridge + iptables FORWARD egress filter. requires
+                            sudo. not supported on macOS.
   --reset                   remove the container and wipe the persistent
-                            volume for the current mode (forces a fresh
-                            create on next launch, picking up any config
-                            edits in this script)
-  --rebuild-base            force rebuild of the base image from scratch
-                            (passes --no-cache so every layer re-runs;
-                            use this when a step's inputs changed
-                            semantically without the RUN line changing)
-  --verify                  after launch, run a short egress check and exit
-  --disable-network-block   run the container without egress restrictions.
-                            skips nft/iptables setup and the WHITELIST_HOSTS
-                            allowlist; all outbound traffic is permitted.
-                            mutually exclusive with --verify.
-  --update                  run in-container refresh (apt upgrade, mise
-                            upgrade, claude code update, lazyvim plugin
-                            sync) against the currently-running container.
-                            requires a container already running from a
-                            prior ./launch.sh in another terminal.
-                            mutually exclusive with --reset, --rebuild-base,
-                            --verify.
+                            volume for the current mode (forces a fresh create
+                            on next launch, picking up any config edits).
+  --rebuild-base            force rebuild of the base image (--no-cache).
+  --verify                  after launch, run a short egress check and exit.
+  --disable-network-block   run without egress restrictions (all outbound
+                            traffic permitted). mutually exclusive with --verify.
+  --update                  in-container refresh (apt upgrade, mise, claude
+                            code, lazyvim). requires a container already running
+                            in another terminal. mutually exclusive with
+                            --reset, --rebuild-base, --verify.
   env-file                  path to env file (default: .env)
 EOF
             exit 0
@@ -96,9 +104,8 @@ if ! $DISABLE_NETWORK_BLOCK; then
 fi
 
 # Canary IP the container tries to reach at startup to prove the egress
-# filter is enforcing. Must be reachable on the open internet (so its
-# unreachability is attributable to OUR filter, not a routing dead-end) and
-# must NOT appear in the resolved allowlist. example.com is the default.
+# filter is enforcing. Must be reachable on the open internet and must NOT
+# appear in the resolved allowlist. example.com is the default.
 CANARY_BLOCKED_IP="${CANARY_BLOCKED_IP:-93.184.216.34}"
 
 if [[ ! -f "$DEPLOY_KEY_PATH" ]]; then
@@ -121,9 +128,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_SCRIPT="$SCRIPT_DIR/setup.sh"
 DOCKERFILE="$SCRIPT_DIR/Dockerfile"
 NOTIFY_LISTENER="$SCRIPT_DIR/host_listener.py"
-NOTIFY_SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID}/rc-notify.sock"
 [[ -f "$SETUP_SCRIPT" ]] || { echo "error: setup.sh not found at $SETUP_SCRIPT" >&2; exit 1; }
 [[ -f "$DOCKERFILE"    ]] || { echo "error: Dockerfile not found at $DOCKERFILE" >&2; exit 1; }
+
+# ---- notify socket path (OS-specific) --------------------------------------
+# Linux: XDG_RUNTIME_DIR (or /run/user/$UID) — standard for user services.
+# macOS: ~/.local/share/containers — this directory is shared into the podman
+#        machine VM via virtiofs (Apple VZ default), so the socket file is
+#        reachable as a volume mount from containers running inside the VM.
+#        The path must be inside the home directory for virtiofs to see it.
+if [[ $OS == "macos" ]]; then
+    NOTIFY_SOCK_DIR="${HOME}/.local/share/containers"
+    mkdir -p "$NOTIFY_SOCK_DIR"
+    NOTIFY_SOCK="${NOTIFY_SOCK_DIR}/rc-notify.sock"
+else
+    NOTIFY_SOCK="${XDG_RUNTIME_DIR:-/run/user/$UID}/rc-notify.sock"
+fi
 
 IMAGE_NAME="remote-code-base:latest"
 
@@ -132,17 +152,27 @@ IMAGE_NAME="remote-code-base:latest"
 CONTAINER_NAME="remote-code-${PROJECT_NAME}"
 VOLUME_NAME="remote-code-vol-${PROJECT_NAME}"
 
-# rootful-only identifiers
+# Used by both macOS (bridge in VM) and Linux rootful (bridge on host).
 NET_NAME="remote-code-net-${PROJECT_NAME}"
 SLUG=$(printf '%s' "$PROJECT_NAME" | tr -c 'A-Za-z0-9' _ | cut -c1-14)
-CHAIN_NAME="REMOTE-CODE-${SLUG}"
-SUBNET_HEX=$(printf '%s' "$PROJECT_NAME" | md5sum | cut -c1-2)
+CHAIN_NAME="REMOTE-CODE-${SLUG}"   # Linux rootful iptables chain name
+
+# md5 differs between Linux (md5sum) and macOS (md5).
+md5_hex() {
+    if [[ $OS == "macos" ]]; then
+        printf '%s' "$1" | md5
+    else
+        printf '%s' "$1" | md5sum | awk '{print $1}'
+    fi
+}
+
+SUBNET_HEX=$(md5_hex "$PROJECT_NAME" | cut -c1-2)
 SUBNET_OCTET=$(( 16#${SUBNET_HEX} % 200 + 40 ))
 SUBNET="10.89.${SUBNET_OCTET}.0/24"
 GATEWAY="10.89.${SUBNET_OCTET}.1"
 
-# rootless-only identifiers. systemd treats '-' in slice names as a path
-# separator ('a-b.slice' -> 'a.slice/a-b.slice'), so normalize to '_'.
+# rootless Linux-only identifiers. systemd treats '-' in slice names as a
+# path separator ('a-b.slice' -> 'a.slice/a-b.slice'), so normalise to '_'.
 SAFE_PROJECT=$(echo "$PROJECT_NAME" | tr '-' '_')
 SLICE_NAME="rcode_${SAFE_PROJECT}.slice"
 WARMUP_UNIT="rcode_warmup_${SAFE_PROJECT}.service"
@@ -151,7 +181,7 @@ NFT_TABLE="rcode_${SAFE_PROJECT}"
 GIT_HOST="$(echo "$REPO_URL" | sed -E 's#^(git@|ssh://git@|https://)##; s#[:/].*$##')"
 ALL_HOSTS="$GIT_HOST $WHITELIST_HOSTS"
 
-# ---- podman wrapper (sudo only in rootful mode) ----------------------------
+# ---- podman wrapper (sudo only in Linux rootful mode) ----------------------
 
 if [[ $MODE == rootful ]]; then
     PODMAN=(sudo podman)
@@ -159,10 +189,50 @@ else
     PODMAN=(podman)
 fi
 
+# ---- DNS resolution (portable) ---------------------------------------------
+# getent(1) is Linux-only. On macOS we use python3's socket module, which
+# respects /etc/hosts and the system resolver the same way getent would.
+resolve_ipv4() {
+    local h="$1"
+    if [[ $OS == "macos" ]]; then
+        python3 - "$h" <<'PYEOF' 2>/dev/null || true
+import socket, sys
+try:
+    infos = socket.getaddrinfo(sys.argv[1], None, socket.AF_INET)
+    print('\n'.join(sorted({info[4][0] for info in infos})))
+except Exception:
+    pass
+PYEOF
+    else
+        getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u || true
+    fi
+}
+
+# ---- macOS: podman machine check -------------------------------------------
+# On macOS, podman delegates all container operations to a Linux VM managed
+# by podman machine. Ensure the VM exists and is running before proceeding.
+if [[ $OS == "macos" ]]; then
+    echo "==> checking podman machine (macOS)"
+    if ! command -v podman >/dev/null 2>&1; then
+        echo "error: podman not found. install via: brew install podman" >&2
+        exit 1
+    fi
+    MACHINE_NAME=$(podman machine list --format "{{.Name}}" --noheading 2>/dev/null | head -n1 || true)
+    if [[ -z "$MACHINE_NAME" ]]; then
+        echo "error: no podman machine found." >&2
+        echo "       initialise one with: podman machine init && podman machine start" >&2
+        exit 1
+    fi
+    MACHINE_RUNNING=$(podman machine list --format "{{.Running}}" --noheading 2>/dev/null | head -n1 || true)
+    if [[ "$MACHINE_RUNNING" != "true" ]]; then
+        echo "==> starting podman machine: $MACHINE_NAME"
+        podman machine start "$MACHINE_NAME"
+    else
+        echo "    podman machine '$MACHINE_NAME' is running"
+    fi
+fi
+
 # ---- --update: in-container refresh against running container --------------
-# Must bail before pre-flight + network-filter install; otherwise we'd
-# rebuild the nft table on top of the one held open by the launch that's
-# currently owning the container, wiping its egress rules.
 if $UPDATE; then
     if ! "${PODMAN[@]}" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
         echo "error: container $CONTAINER_NAME does not exist. run './launch.sh' first." >&2
@@ -185,8 +255,6 @@ mise self-update -y || true
 mise upgrade
 echo "--- claude code (global pnpm)"
 pnpm update -g @anthropic-ai/claude-code
-# pnpm v10 blocks global postinstall; re-run claude-code install.cjs manually,
-# same dance as the Dockerfile does on first install.
 node "$(pnpm root -g)/@anthropic-ai/claude-code/install.cjs"
 echo "--- lazyvim plugin sync"
 nvim --headless "+Lazy! sync" +qa
@@ -197,9 +265,20 @@ fi
 
 # ---- pre-flight ------------------------------------------------------------
 
-echo "==> pre-flight (mode=$MODE)"
+echo "==> pre-flight (os=$OS, mode=$MODE)"
 
-if [[ $MODE == rootless ]]; then
+if [[ $OS == "macos" ]]; then
+    # macOS: pasta, nftables, systemd, and loginctl all live inside the podman
+    # machine VM — we do not check for them on the host. No host-level sudo is
+    # needed either: nft rules are applied inside the VM via
+    # 'podman machine ssh -- sudo nft', which uses the VM's internal
+    # passwordless sudo and does not prompt on the macOS host.
+    if ! podman info >/dev/null 2>&1; then
+        echo "error: 'podman info' failed. is the podman machine running?" >&2
+        echo "       try: podman machine start" >&2
+        exit 1
+    fi
+elif [[ $MODE == rootless ]]; then
     if [[ $EUID -eq 0 ]]; then
         echo "error: rootless mode must run as a regular user (no sudo). use --rootful to run rootful." >&2
         exit 1
@@ -218,17 +297,15 @@ if [[ $MODE == rootless ]]; then
         exit 1
     fi
 else
-    # rootful: sudo for both podman and iptables
+    # Linux rootful: sudo for both podman and iptables.
     if ! sudo -n true 2>/dev/null; then
         echo "    this script needs sudo to run rootful podman + install iptables rules"
         sudo -v || { echo "error: sudo required" >&2; exit 1; }
     fi
 fi
 
-# When the egress filter is active, both modes need sudo (nft in rootless;
-# podman+iptables in rootful). With --disable-network-block, rootless needs
-# no sudo at all, and rootful only needs what was primed above for podman.
-if ! $DISABLE_NETWORK_BLOCK && ! sudo -n true 2>/dev/null; then
+# Linux only: prompt for sudo upfront if the egress filter will need it.
+if [[ $OS == "linux" ]] && ! $DISABLE_NETWORK_BLOCK && ! sudo -n true 2>/dev/null; then
     echo
     echo "  ┌──────────────────────────────────────────────────────────────────┐"
     if [[ $MODE == rootless ]]; then
@@ -246,12 +323,8 @@ if ! $DISABLE_NETWORK_BLOCK && ! sudo -n true 2>/dev/null; then
     sudo -v || { echo "error: sudo required" >&2; exit 1; }
 fi
 
-# ---- --reset: confirm destroy up-front ------------------------------------
-# We do the scan + prompt here (before rebuild-base, before allowlist
-# resolution, before nft/iptables install) so that aborting doesn't waste
-# a multi-minute base-image rebuild or leave a half-installed egress
-# filter that the trap then has to clean up. The actual rm of the
-# container/volume still happens later, next to the volume-create step.
+# ---- --reset: confirm destroy up-front -------------------------------------
+
 if ! $VERIFY && $RESET; then
     if "${PODMAN[@]}" volume inspect "$VOLUME_NAME" >/dev/null 2>&1 \
        && "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
@@ -295,19 +368,17 @@ fi
 
 # ---- base image ------------------------------------------------------------
 
-# --verify uses an ephemeral alpine container, not the base image; skip the
-# build to keep the smoke test fast on first run.
 if $VERIFY; then
     echo "==> --verify: skipping base image build"
 elif $REBUILD_BASE; then
-    echo "==> rebuilding base image $IMAGE_NAME from scratch (mode=$MODE, --no-cache)"
+    echo "==> rebuilding base image $IMAGE_NAME from scratch (os=$OS, --no-cache)"
     "${PODMAN[@]}" build --no-cache -t "$IMAGE_NAME" -f "$DOCKERFILE" "$SCRIPT_DIR"
     if "${PODMAN[@]}" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
         echo "    note: container $CONTAINER_NAME still references the old image layers."
-        echo "    run --reset (or 'podman rm -f $CONTAINER_NAME') to create a fresh one from the rebuilt image."
+        echo "    run --reset (or 'podman rm -f $CONTAINER_NAME') to create a fresh one."
     fi
 elif ! "${PODMAN[@]}" image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    echo "==> building base image $IMAGE_NAME (mode=$MODE)"
+    echo "==> building base image $IMAGE_NAME (os=$OS)"
     "${PODMAN[@]}" build -t "$IMAGE_NAME" -f "$DOCKERFILE" "$SCRIPT_DIR"
 else
     echo "==> using cached base image $IMAGE_NAME"
@@ -317,14 +388,14 @@ fi
 
 declare -a ALLOWED_IPS=()
 declare -a ADD_HOST_ARGS=()
-declare -A SEEN_IPS=()
+SEEN_IPS=""   # newline-separated list for dedup (bash 3.2 compatible)
 
 if $DISABLE_NETWORK_BLOCK; then
     echo "==> --disable-network-block: skipping allowlist resolution"
 else
     echo "==> resolving allowlist"
     for h in $ALL_HOSTS; do
-        ips=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u || true)
+        ips=$(resolve_ipv4 "$h")
         if [[ -z "$ips" ]]; then
             echo "    warn: $h did not resolve — skipping"
             continue
@@ -332,12 +403,13 @@ else
         first_ip=$(echo "$ips" | head -n1)
         ADD_HOST_ARGS+=(--add-host "${h}:${first_ip}")
         while IFS= read -r ip; do
-            if [[ -z "${SEEN_IPS[$ip]:-}" ]]; then
+            if ! echo "$SEEN_IPS" | grep -qxF "$ip"; then
                 ALLOWED_IPS+=("$ip")
-                SEEN_IPS[$ip]=1
+                SEEN_IPS="${SEEN_IPS}${ip}
+"
             fi
         done <<< "$ips"
-        printf '    %-40s -> %s\n' "$h" "$(echo $ips | tr '\n' ' ')"
+        printf '    %-40s -> %s\n' "$h" "$(echo "$ips" | tr '\n' ' ')"
     done
 
     if [[ ${#ALLOWED_IPS[@]} -eq 0 ]]; then
@@ -345,8 +417,6 @@ else
         exit 1
     fi
 
-    # Guard against the canary being accidentally on the allowlist — that would
-    # make the container's self-check pass even when the filter is broken.
     for ip in "${ALLOWED_IPS[@]}"; do
         if [[ "$ip" == "$CANARY_BLOCKED_IP" ]]; then
             echo "error: CANARY_BLOCKED_IP ($CANARY_BLOCKED_IP) is in the resolved allowlist." >&2
@@ -360,15 +430,16 @@ fi
 
 cleanup() {
     echo
-    echo "==> tearing down ($MODE)"
-    # Stop the container but leave it (and its writable overlay) in place
-    # so runtime-installed packages, state under /var, /etc edits, etc.
-    # survive across launches. Use --reset to actually remove it.
+    echo "==> tearing down (os=$OS, mode=$MODE)"
     "${PODMAN[@]}" stop -t 10 "$CONTAINER_NAME" >/dev/null 2>&1 || true
     if $DISABLE_NETWORK_BLOCK; then
         return
     fi
-    if [[ $MODE == rootless ]]; then
+    if [[ $OS == "macos" ]]; then
+        # Remove nft rules from inside the VM, then remove the podman network.
+        podman machine ssh -- sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+        podman network rm -f "$NET_NAME" >/dev/null 2>&1 || true
+    elif [[ $MODE == rootless ]]; then
         sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
         systemctl --user stop "$WARMUP_UNIT" 2>/dev/null || true
         systemctl --user reset-failed "$SLICE_NAME" 2>/dev/null || true
@@ -385,11 +456,46 @@ trap cleanup EXIT INT TERM
 
 if $DISABLE_NETWORK_BLOCK; then
     echo "==> --disable-network-block: skipping egress filter install"
+
+elif [[ $OS == "macos" ]]; then
+    # macOS: create a bridge network inside the podman machine VM, then install
+    # an nftables FORWARD filter in the VM to restrict container egress by subnet.
+    # No firewall changes are made on the macOS host itself.
+    #
+    # The nft rule explicitly allows traffic to the bridge gateway so DNS
+    # (forwarded by the VM's gateway) continues to work inside the container.
+    podman network rm -f "$NET_NAME" >/dev/null 2>&1 || true
+    podman network create \
+        --subnet "$SUBNET" \
+        --gateway "$GATEWAY" \
+        --driver bridge \
+        "$NET_NAME" >/dev/null
+    echo "==> created podman network $NET_NAME ($SUBNET) inside VM"
+
+    ALLOWED_SET=$(IFS=,; echo "${ALLOWED_IPS[*]}")
+    echo "==> installing nft egress filter inside podman machine VM"
+    podman machine ssh -- sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    podman machine ssh -- sudo nft -f - <<EOF
+table inet $NFT_TABLE {
+    set allowed_v4 {
+        type ipv4_addr
+        elements = { $ALLOWED_SET }
+    }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        ip saddr $SUBNET ip daddr $GATEWAY accept comment "allow gateway and DNS"
+        ip saddr $SUBNET ip daddr @allowed_v4 accept
+        ip saddr $SUBNET counter drop
+    }
+}
+EOF
+    echo "    installed nft table inet $NFT_TABLE: ${#ALLOWED_IPS[@]} allowed IPs"
+
 elif [[ $MODE == rootless ]]; then
-    # Pre-create the slice via a warmup service so the cgroup exists before
-    # we install the nft rule (nft resolves cgroupv2 paths to inodes at
-    # rule-load time; the path must exist then). The warmup holds the slice
-    # open so the cgroup survives for the container's lifetime.
+    # Linux rootless: pre-create the systemd user slice so the cgroup exists
+    # before the nft rule is loaded (nft resolves cgroupv2 paths to inodes at
+    # rule-load time; the path must exist then). The warmup service holds the
+    # slice open for the container's lifetime.
     echo "==> starting slice warmup: $SLICE_NAME"
     systemctl --user stop "$WARMUP_UNIT" 2>/dev/null || true
     systemd-run --user --quiet \
@@ -397,7 +503,6 @@ elif [[ $MODE == rootless ]]; then
         --unit="$WARMUP_UNIT" \
         sleep infinity
 
-    # Wait briefly for the slice cgroup to appear.
     SLICE_CGROUP=""
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         SLICE_CGROUP=$(systemctl --user show "$SLICE_NAME" --property=ControlGroup --value 2>/dev/null || true)
@@ -408,19 +513,11 @@ elif [[ $MODE == rootless ]]; then
         echo "error: slice cgroup did not materialize: $SLICE_CGROUP" >&2
         exit 1
     fi
-    # nft resolves the cgroupv2 string via a literal stat("/sys/fs/cgroup/" +
-    # string) — no tree walking, not a basename match. So we feed the full
-    # cgroup path stripped of its leading slash. `level N` is independent
-    # metadata telling the kernel how many ancestors up from the socket's
-    # cgroup to compare against; it must equal the depth of the path below.
     SLICE_CGROUP_REL="${SLICE_CGROUP#/}"
     SLICE_LEVEL=$(echo "$SLICE_CGROUP_REL" | tr / '\n' | grep -c .)
     echo "    slice cgroup: $SLICE_CGROUP"
     echo "    slice level:  $SLICE_LEVEL"
 
-    # Install nft table. Loopback is accept-first so the container can reach
-    # its own DNS stub (pasta terminates DNS in userspace and reopens a host
-    # socket, typically to 127.0.0.53 on systemd-resolved hosts).
     ALLOWED_SET=$(IFS=,; echo "${ALLOWED_IPS[*]}")
     sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     sudo nft -f - <<EOF
@@ -438,8 +535,9 @@ table inet $NFT_TABLE {
 }
 EOF
     echo "==> installed nft egress filter: table inet $NFT_TABLE, ${#ALLOWED_IPS[@]} allowed IPs"
+
 else
-    # Rootful: dedicated bridge + FORWARD-chain filter on the subnet.
+    # Linux rootful: dedicated bridge + FORWARD-chain iptables filter.
     "${PODMAN[@]}" network rm -f "$NET_NAME" >/dev/null 2>&1 || true
     "${PODMAN[@]}" network create \
         --subnet "$SUBNET" \
@@ -462,36 +560,68 @@ else
     echo "==> installed iptables egress filter: chain $CHAIN_NAME, ${#ALLOWED_IPS[@]} allowed IPs"
 fi
 
-# ---- host-side notification listener --------------------------------------
-# Start a persistent UDS listener as a systemd user service so a
-# compromised container can only signal a whitelisted event (done /
-# waiting) — never render arbitrary notification text under the
-# "Claude Code" brand. The listener persists across launches
-# (intentional: single global listener shared by any project's
-# container). Stop it manually via
-# `systemctl --user stop rc-notify.service` when you want it gone.
+# ---- host-side notification listener ---------------------------------------
+
 if ! $VERIFY; then
-    if systemctl --user is-active --quiet rc-notify.service 2>/dev/null; then
-        echo "==> rc-notify listener already running"
-    elif [[ -f "$NOTIFY_LISTENER" ]] && command -v systemd-run >/dev/null 2>&1; then
-        echo "==> starting rc-notify listener on $NOTIFY_SOCK"
-        systemctl --user reset-failed rc-notify.service 2>/dev/null || true
-        systemctl --user stop rc-notify.service 2>/dev/null || true
-        systemd-run --user --quiet \
-            --unit=rc-notify.service \
-            --description="remote-code-harness notification listener" \
-            python3 "$NOTIFY_LISTENER"
-        # Wait briefly for the socket to bind.
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            [[ -S "$NOTIFY_SOCK" ]] && break
-            sleep 0.1
-        done
+    if [[ $OS == "macos" ]]; then
+        # macOS: no systemd. Start the listener as a background process tracked
+        # by a PID file so we do not start duplicates across launches.
+        NOTIFY_PID_FILE="/tmp/rc-notify-${USER}.pid"
+        LISTENER_RUNNING=false
+        if [[ -f "$NOTIFY_PID_FILE" ]]; then
+            OLD_PID=$(cat "$NOTIFY_PID_FILE" 2>/dev/null || echo "")
+            if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null && [[ -S "$NOTIFY_SOCK" ]]; then
+                LISTENER_RUNNING=true
+                echo "==> rc-notify listener already running (pid $OLD_PID)"
+            fi
+        fi
+        if ! $LISTENER_RUNNING && [[ -f "$NOTIFY_LISTENER" ]]; then
+            echo "==> starting rc-notify listener on $NOTIFY_SOCK"
+            rm -f "$NOTIFY_SOCK"
+            nohup python3 "$NOTIFY_LISTENER" >>/tmp/rc-notify.log 2>&1 &
+            echo $! > "$NOTIFY_PID_FILE"
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                [[ -S "$NOTIFY_SOCK" ]] && break
+                sleep 0.1
+            done
+        fi
+    else
+        # Linux: manage via systemd user service so it persists across launches
+        # independently of this shell's lifetime.
+        if systemctl --user is-active --quiet rc-notify.service 2>/dev/null; then
+            echo "==> rc-notify listener already running"
+        elif [[ -f "$NOTIFY_LISTENER" ]] && command -v systemd-run >/dev/null 2>&1; then
+            echo "==> starting rc-notify listener on $NOTIFY_SOCK"
+            systemctl --user reset-failed rc-notify.service 2>/dev/null || true
+            systemctl --user stop rc-notify.service 2>/dev/null || true
+            systemd-run --user --quiet \
+                --unit=rc-notify.service \
+                --description="remote-code-harness notification listener" \
+                python3 "$NOTIFY_LISTENER"
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                [[ -S "$NOTIFY_SOCK" ]] && break
+                sleep 0.1
+            done
+        fi
     fi
 fi
 
 declare -a NOTIFY_VOLUME_ARGS=()
 if [[ -S "$NOTIFY_SOCK" ]]; then
-    NOTIFY_VOLUME_ARGS=(--volume "$NOTIFY_SOCK:/run/notify.sock")
+    if [[ $OS == "macos" ]]; then
+        # Verify the VM can actually see the socket via virtiofs before mounting.
+        # If the home directory is not shared (non-default podman machine config),
+        # we skip the mount and warn rather than failing hard.
+        if podman machine ssh -- "test -S '$NOTIFY_SOCK'" 2>/dev/null; then
+            NOTIFY_VOLUME_ARGS=(--volume "$NOTIFY_SOCK:/run/notify.sock")
+        else
+            echo "    warn: VM cannot see socket at $NOTIFY_SOCK"
+            echo "    warn: virtiofs may not be sharing the home directory in your podman machine config"
+            echo "    warn: container notification hooks will fail silently"
+        fi
+    else
+        NOTIFY_VOLUME_ARGS=(--volume "$NOTIFY_SOCK:/run/notify.sock")
+    fi
 else
     echo "    warn: rc-notify socket not present at $NOTIFY_SOCK — container hooks will fail silently"
 fi
@@ -500,10 +630,7 @@ fi
 
 if ! $VERIFY; then
     if $RESET; then
-        # User confirmation for --reset (including the /root/work
-        # dirty-repo scan) happened up-front, right after pre-flight.
-        # By now we just do the actual destruction.
-        echo "==> --reset: removing container $CONTAINER_NAME and wiping volume $VOLUME_NAME (mode=$MODE)"
+        echo "==> --reset: removing container $CONTAINER_NAME and wiping volume $VOLUME_NAME (os=$OS)"
         "${PODMAN[@]}" rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
         "${PODMAN[@]}" volume rm -f "$VOLUME_NAME" >/dev/null 2>&1 || true
     fi
@@ -515,12 +642,6 @@ if ! $VERIFY; then
     fi
 fi
 
-# Containers persist across launches (no --rm): the writable overlay
-# keeps runtime-installed apt packages, service state, and /etc edits.
-# podman run flags (caps, volumes, env, publish ports, memory, cpus) are
-# frozen at create time, so to pick up config changes you need to remove
-# the container (`podman rm -f $CONTAINER_NAME`, or use --reset which
-# also wipes the volume).
 CONTAINER_EXISTS=false
 if ! $VERIFY && "${PODMAN[@]}" container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
     CONTAINER_EXISTS=true
@@ -529,21 +650,19 @@ fi
 # ---- launch ----------------------------------------------------------------
 
 echo
-echo "==> launching container $CONTAINER_NAME (mode=$MODE)"
+echo "==> launching container $CONTAINER_NAME (os=$OS, mode=$MODE)"
 echo "    repo:    $REPO_URL"
 echo "    webapp:  $WEBAPP_CMD (port $WEBAPP_PORT)"
 echo "    rc:      port $RC_PORT"
 echo
 
-# Shared podman args. No --rm: the container persists across launches
-# (see container-existence check above). First launch uses `podman run`
-# with this full arg list; subsequent launches use `podman start -ai` on
-# the existing container.
+# HOST_OS is passed into the container so setup.sh can tailor its instructions
+# (e.g. the podman socket path for VSCode differs between Linux and macOS).
 PODMAN_ARGS=(
     run -it
     --name "$CONTAINER_NAME"
     --hostname remote-code
-    "${ADD_HOST_ARGS[@]}"
+    ${ADD_HOST_ARGS[@]:+"${ADD_HOST_ARGS[@]}"}
     --memory="$MEM_LIMIT"
     --cpus="$CPU_LIMIT"
     --pids-limit="$PIDS_LIMIT"
@@ -560,25 +679,30 @@ PODMAN_ARGS=(
     --volume "$VOLUME_NAME:/root"
     --volume "$DEPLOY_KEY_PATH:/tmp/deploy_key:ro"
     --volume "$SETUP_SCRIPT:/setup.sh:ro"
-    "${SHARED_DATA_VOLUME_ARGS[@]}"
-    "${NOTIFY_VOLUME_ARGS[@]}"
+    ${SHARED_DATA_VOLUME_ARGS[@]:+"${SHARED_DATA_VOLUME_ARGS[@]}"}
+    ${NOTIFY_VOLUME_ARGS[@]:+"${NOTIFY_VOLUME_ARGS[@]}"}
     --env "PROJECT_NAME=$PROJECT_NAME"
     --env "REPO_URL=$REPO_URL"
     --env "WEBAPP_CMD=$WEBAPP_CMD"
     --env "WEBAPP_PORT=$WEBAPP_PORT"
     --env "RC_PORT=$RC_PORT"
     --env "CANARY_BLOCKED_IP=$CANARY_BLOCKED_IP"
+    --env "HOST_OS=$OS"
     --publish "127.0.0.1:${WEBAPP_PORT}:${WEBAPP_PORT}"
     --publish "127.0.0.1:${RC_PORT}:${RC_PORT}"
 )
 
-if [[ $MODE == rootless ]]; then
-    # --verify runs a smoke test instead of the normal setup.sh.
+if [[ $OS == "macos" ]]; then
+    # macOS: containers run inside the podman machine VM. No systemd-run scope
+    # is needed — the VM-level nft FORWARD filter applies to all container
+    # traffic on the bridge network, regardless of which process launched them.
+
     if $VERIFY; then
         echo "==> --verify: running egress smoke test in ephemeral container"
         ALLOWED_HOST="github.com"
-        systemd-run --user --scope --quiet --slice="$SLICE_NAME" -- \
-            podman run --rm --network=pasta "${ADD_HOST_ARGS[@]}" \
+        podman run --rm \
+            --network "$NET_NAME" \
+            ${ADD_HOST_ARGS[@]:+"${ADD_HOST_ARGS[@]}"} \
             alpine sh -c "
                 set -e
                 echo '--- expect OK: allowlisted host'
@@ -595,9 +719,42 @@ if [[ $MODE == rootless ]]; then
         exit 0
     fi
 
-    # Build the podman invocation: `start -ai` for an existing container,
-    # full `run ...` args for a fresh create. podman run flags are frozen
-    # at create time, so `start` doesn't re-apply them.
+    if $CONTAINER_EXISTS; then
+        echo "==> reusing existing container $CONTAINER_NAME (use --reset to recreate)"
+        podman start -ai "$CONTAINER_NAME"
+    else
+        echo "==> creating new container $CONTAINER_NAME"
+        declare -a NETWORK_ARG=()
+        if ! $DISABLE_NETWORK_BLOCK; then
+            NETWORK_ARG=(--network "$NET_NAME")
+        fi
+        podman "${PODMAN_ARGS[@]}" ${NETWORK_ARG[@]:+"${NETWORK_ARG[@]}"} "$IMAGE_NAME" /bin/bash /setup.sh
+    fi
+
+elif [[ $MODE == rootless ]]; then
+    # Linux rootless: wrap in systemd-run scope so the process lands in the
+    # slice whose cgroup the nft rule is matching against.
+    if $VERIFY; then
+        echo "==> --verify: running egress smoke test in ephemeral container"
+        ALLOWED_HOST="github.com"
+        systemd-run --user --scope --quiet --slice="$SLICE_NAME" -- \
+            podman run --rm --network=pasta ${ADD_HOST_ARGS[@]:+"${ADD_HOST_ARGS[@]}"} \
+            alpine sh -c "
+                set -e
+                echo '--- expect OK: allowlisted host'
+                wget -qO- --timeout=5 https://${ALLOWED_HOST} >/dev/null && echo '  OK: ${ALLOWED_HOST} reachable'
+                echo '--- expect FAIL: blocked IP'
+                if wget -qO- --timeout=5 http://${CANARY_BLOCKED_IP} >/dev/null 2>&1; then
+                    echo '  FAIL: ${CANARY_BLOCKED_IP} was reachable — allowlist is not enforcing!' >&2
+                    exit 1
+                else
+                    echo '  OK: ${CANARY_BLOCKED_IP} blocked'
+                fi
+            "
+        echo "==> verify passed"
+        exit 0
+    fi
+
     if $CONTAINER_EXISTS; then
         echo "==> reusing existing container $CONTAINER_NAME (use --reset to recreate)"
         PODMAN_CMD=(podman start -ai "$CONTAINER_NAME")
@@ -611,9 +768,11 @@ if [[ $MODE == rootless ]]; then
     else
         systemd-run --user --scope --quiet --slice="$SLICE_NAME" -- "${PODMAN_CMD[@]}"
     fi
+
 else
+    # Linux rootful.
     if $VERIFY; then
-        echo "error: --verify is only implemented for rootless mode" >&2
+        echo "error: --verify is only implemented for rootless (Linux) and macOS modes" >&2
         exit 1
     fi
 
@@ -621,8 +780,6 @@ else
         echo "==> reusing existing container $CONTAINER_NAME (use --reset to recreate)"
         sudo podman start -ai "$CONTAINER_NAME"
     elif $DISABLE_NETWORK_BLOCK; then
-        # No custom bridge / iptables filter: fall back to podman's default
-        # network. All outbound traffic is permitted.
         sudo podman "${PODMAN_ARGS[@]}" \
             "$IMAGE_NAME" \
             /bin/bash /setup.sh

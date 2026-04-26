@@ -12,6 +12,11 @@ set -euo pipefail
 : "${RC_PORT:?}"
 : "${CANARY_BLOCKED_IP:?}"
 
+# HOST_OS is set by launch.sh on the host and passed in as an env var.
+# It never affects container behaviour (the container is always Linux);
+# it only controls which host-side instructions are printed at the end.
+HOST_OS="${HOST_OS:-linux}"
+
 WORKDIR="/root/work/${PROJECT_NAME}"
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -22,47 +27,53 @@ export PATH="/root/.local/bin:$PATH"
 eval "$(/root/.local/bin/mise activate bash)"
 
 # Egress filter self-check. Runs BEFORE any network-using step so that if
-# the host's egress filter isn't enforcing, we abort before the deploy key
+# the host's egress filter is not enforcing, we abort before the deploy key
 # is used, the repo is cloned, or package managers phone home.
 #
 # Two probes using bash's built-in /dev/tcp (no external deps):
 #   1. CANARY_BLOCKED_IP must be unreachable — proves the filter is dropping
 #      non-allowlisted destinations.
-#   2. GIT_HOST must be reachable — proves the allowlist isn't globally
-#      blocking (avoids a silently-broken harness that "passes" the block
-#      test only because all egress is down).
+#   2. GIT_HOST must be reachable — proves the allowlist is not globally
+#      broken (avoids a harness that "passes" only because all egress is down).
 #
-# nft `drop` action silently discards packets, so a working filter shows up
-# as a connect timeout rather than a TCP reset. 3s is enough.
+# nft `drop` silently discards packets, so a working filter appears as a
+# connect timeout rather than a TCP reset. 3s is enough.
 GIT_HOST="$(echo "$REPO_URL" | sed -E 's#^(git@|ssh://git@|https://)##; s#[:/].*$##')"
-log "egress self-check (block: $CANARY_BLOCKED_IP, allow: $GIT_HOST)"
+# Extract an explicit SSH port from ssh:// URLs (defaults to 22). Useful when an
+# ISP or firewall blocks port 22 — in that case set REPO_URL to something like
+# ssh://git@ssh.github.com:443/owner/repo.git and the harness will probe and
+# keyscan on the right port.
+GIT_SSH_PORT="$(echo "$REPO_URL" | sed -nE 's#^ssh://git@[^:/]+:([0-9]+)/.*#\1#p')"
+GIT_SSH_PORT="${GIT_SSH_PORT:-22}"
+log "egress self-check (block: $CANARY_BLOCKED_IP, allow: $GIT_HOST:$GIT_SSH_PORT)"
 if timeout 3 bash -c "echo > /dev/tcp/${CANARY_BLOCKED_IP}/80" 2>/dev/null; then
     cat >&2 <<EOF
 
 FATAL: egress filter is NOT enforcing.
   ${CANARY_BLOCKED_IP} was reachable on TCP/80, but it is not in the
-  allowlist. The host's nft table or iptables chain is either missing,
-  not matching this container's traffic, or installed against a stale
-  cgroup. Aborting before this container touches the network.
+  allowlist. The nft table is either missing, not matching this container's
+  traffic, or installed against a stale cgroup/network. Aborting before
+  this container touches the network.
 
   On the host, check:
-    mode=rootless: sudo nft list table inet rcode_\${PROJECT_NAME//-/_}
-    mode=rootful : sudo iptables -nvL REMOTE-CODE-\${PROJECT_NAME-slug}
+    Linux rootless:  sudo nft list table inet rcode_\${PROJECT_NAME//-/_}
+    Linux rootful:   sudo iptables -nvL REMOTE-CODE-<project-slug>
+    macOS:           podman machine ssh -- sudo nft list table inet rcode_\${PROJECT_NAME//-/_}
 EOF
     exit 1
 fi
-if ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/22" 2>/dev/null \
+if ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/${GIT_SSH_PORT}" 2>/dev/null \
    && ! timeout 5 bash -c "echo > /dev/tcp/${GIT_HOST}/443" 2>/dev/null; then
     cat >&2 <<EOF
 
-FATAL: allowlisted host ${GIT_HOST} is unreachable on 22 or 443.
+FATAL: allowlisted host ${GIT_HOST} is unreachable on ${GIT_SSH_PORT} or 443.
   Either the allowlist is misconfigured (is ${GIT_HOST} in WHITELIST_HOSTS
   or resolved via GIT_HOST auto-add?) or host networking is down. Aborting
   before the repo clone.
 EOF
     exit 1
 fi
-echo "  ok: egress filter enforcing (${CANARY_BLOCKED_IP} dropped, ${GIT_HOST} reachable)"
+echo "  ok: egress filter enforcing (${CANARY_BLOCKED_IP} dropped, ${GIT_HOST}:${GIT_SSH_PORT} reachable)"
 
 log "installing deploy key"
 mkdir -p /root/.ssh
@@ -72,7 +83,7 @@ chmod 600 /root/.ssh/id_ed25519
 touch /root/.ssh/known_hosts
 chmod 600 /root/.ssh/known_hosts
 if ! ssh-keygen -F "$GIT_HOST" -f /root/.ssh/known_hosts >/dev/null 2>&1; then
-    ssh-keyscan -H "$GIT_HOST" >> /root/.ssh/known_hosts 2>/dev/null
+    ssh-keyscan -p "$GIT_SSH_PORT" -H "$GIT_HOST" >> /root/.ssh/known_hosts 2>/dev/null
 fi
 
 if [[ -d "$WORKDIR/.git" ]]; then
@@ -92,16 +103,29 @@ echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t devserv
 echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/devserver.log"
 
 log "starting claude remote-control in tmux session 'remote-control'"
-# tmux inherits setup.sh's PATH (mise shims are on it), so `claude` resolves.
-# If claude remote-control exits for any reason, the session drops into bash
-# so you can poke around instead of losing the window.
 tmux new-session -d -s remote-control 'claude remote-control; echo "[claude remote-control exited]"; exec bash'
-# Mirror pane output to a log file too, so you can tail without attaching.
 tmux pipe-pane -t remote-control -o 'cat >>/root/.logs/remote-control.log'
 echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t remote-control"
 echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/remote-control.log"
 
 CNAME="remote-code-$PROJECT_NAME"
+
+# Build OS-specific VSCode socket instructions.
+if [[ "$HOST_OS" == "macos" ]]; then
+    VSCODE_SOCKET_INSTRUCTIONS="  1. Find your podman socket path on macOS:
+       podman machine inspect | python3 -c \"
+import sys, json
+d = json.load(sys.stdin)
+print(d[0]['ConnectionInfo']['PodmanSocket']['Path'])
+\"
+       (typically ~/.local/share/containers/podman/machine/.../podman.sock)"
+else
+    VSCODE_SOCKET_INSTRUCTIONS="  1. On THIS host, enable podman's docker-compat socket so VSCode can
+     see the container:
+       systemctl --user enable --now podman.socket     # rootless mode
+       sudo systemctl enable --now podman.socket       # --rootful mode"
+fi
+
 cat <<EOF
 
 ============================================================
@@ -125,10 +149,7 @@ Ctrl-b d to detach without killing them):
 
 Connect with VSCode (Dev Containers):
 
-  1. On THIS host, enable podman's docker-compat socket so VSCode can
-     see the container:
-       systemctl --user enable --now podman.socket     # rootless mode
-       sudo systemctl enable --now podman.socket       # --rootful mode
+${VSCODE_SOCKET_INSTRUCTIONS}
 
   2. On your local machine, install the 'Dev Containers' extension
      (ms-vscode-remote.remote-containers) and add to settings.json:
@@ -151,10 +172,6 @@ To stop the container:
 
 EOF
 
-# Hold the container open until the user hits Ctrl+C (SIGINT) or Ctrl+D (EOF
-# on stdin). We can't `exec sleep infinity` because sleep as PID 1 ignores
-# default signal actions and doesn't read stdin. Staying in bash with an
-# explicit trap + a stdin read gives us both.
 trap 'echo; echo "shutting down..."; exit 0' INT TERM
 cat >/dev/null || true
 echo
