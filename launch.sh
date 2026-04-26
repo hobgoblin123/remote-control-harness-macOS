@@ -230,6 +230,25 @@ if [[ $OS == "macos" ]]; then
     else
         echo "    podman machine '$MACHINE_NAME' is running"
     fi
+
+    # The egress filter uses nft FORWARD rules inside the VM. Rootless podman
+    # in the VM routes traffic via pasta (userspace networking) which bypasses
+    # the kernel's netfilter entirely — nft rules have no effect. Rootful mode
+    # uses real bridge networking that goes through the FORWARD chain.
+    # This only affects the daemon inside the VM; on the macOS host you still
+    # run `podman` without sudo.
+    if ! $DISABLE_NETWORK_BLOCK; then
+        if podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qi true; then
+            echo "error: podman machine is in rootless mode." >&2
+            echo "       The egress filter requires rootful mode inside the VM so that" >&2
+            echo "       bridge networking goes through the kernel's nft FORWARD chain." >&2
+            echo "       Run:" >&2
+            echo "         podman machine stop" >&2
+            echo "         podman machine set --rootful" >&2
+            echo "         podman machine start" >&2
+            exit 1
+        fi
+    fi
 fi
 
 # ---- --update: in-container refresh against running container --------------
