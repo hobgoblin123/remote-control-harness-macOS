@@ -204,9 +204,12 @@ allowlist only costs you a container restart.
 - [setup.sh](../setup.sh) — runs inside the container as the entrypoint.
   Installs the deploy key, clones the repo (or reuses an existing
   checkout), then starts two tmux sessions: `devserver` and
-  `remote-control`. Then `exec`s into `sleep infinity` to keep the
-  container alive — `podman exec -it ... bash` in to use claude or attach
-  to the tmux sessions. Every step is idempotent.
+  `remote-control` (plus an optional third `tunnel` session running
+  `cloudflared` when `EXPOSE_WEBAPP=true` — see
+  [Connecting from your phone](How%20to%20connect%20to%20container.md#connecting-from-your-phone)).
+  Then `exec`s into `sleep infinity` to keep the container alive —
+  `podman exec -it ... bash` in to use claude or attach to the tmux
+  sessions. Every step is idempotent.
 - [TODO.md](../TODO.md) — known limitations of the current hardening.
 
 ## Best practices

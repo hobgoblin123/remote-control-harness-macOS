@@ -95,6 +95,19 @@ RUN git clone --depth 1 https://github.com/LazyVim/starter /root/.config/nvim \
       "+TSInstallSync bash c diff html javascript jsdoc json jsonc lua luadoc markdown markdown_inline python query regex toml tsx typescript vim vimdoc xml yaml" \
       +qa
 
+# cloudflared: optional public tunnel for the webapp port. Only invoked
+# at runtime when EXPOSE_WEBAPP=true in .env (see setup.sh). Single static
+# binary from cloudflare's GitHub releases.
+RUN set -eu; arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  cf_arch=amd64 ;; \
+      aarch64) cf_arch=arm64 ;; \
+      *) echo "unsupported arch for cloudflared: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" \
+      -o /usr/local/bin/cloudflared \
+ && chmod +x /usr/local/bin/cloudflared
+
 # Remap tmux prefix from C-b to C-a so it doesn't collide with a host-side
 # tmux when attaching from a local tmux pane. Written to /etc/tmux.conf so
 # the change survives across persistent-volume reuse (a /root/.tmux.conf

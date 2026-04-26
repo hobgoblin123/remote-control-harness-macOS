@@ -12,6 +12,8 @@ set -euo pipefail
 : "${RC_PORT:?}"
 : "${CANARY_BLOCKED_IP:?}"
 
+EXPOSE_WEBAPP="${EXPOSE_WEBAPP:-false}"
+
 WORKDIR="/root/work/${PROJECT_NAME}"
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -91,6 +93,16 @@ tmux pipe-pane -t devserver -o 'cat >>/root/.logs/devserver.log'
 echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t devserver"
 echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/devserver.log"
 
+if [[ "$EXPOSE_WEBAPP" == "true" ]]; then
+    log "starting cloudflared quick tunnel in tmux session 'tunnel' (-> port $WEBAPP_PORT)"
+    : > /root/.logs/tunnel.log
+    rm -f /root/.logs/tunnel-url.txt
+    tmux new-session -d -s tunnel "cloudflared tunnel --url http://localhost:$WEBAPP_PORT 2>&1; echo '[cloudflared exited]'; exec bash"
+    tmux pipe-pane -t tunnel -o 'cat >>/root/.logs/tunnel.log'
+    echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t tunnel"
+    echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/tunnel.log"
+fi
+
 log "starting claude remote-control in tmux session 'remote-control'"
 # tmux inherits setup.sh's PATH (mise shims are on it), so `claude` resolves.
 # If claude remote-control exits for any reason, the session drops into bash
@@ -102,6 +114,53 @@ echo "  attach: podman exec -it remote-code-$PROJECT_NAME tmux attach -t remote-
 echo "  tail:   podman exec -it remote-code-$PROJECT_NAME tail -f /root/.logs/remote-control.log"
 
 CNAME="remote-code-$PROJECT_NAME"
+
+TUNNEL_BANNER=""
+if [[ "$EXPOSE_WEBAPP" == "true" ]]; then
+    log "waiting for cloudflared tunnel URL (up to 30s)"
+    TUNNEL_URL=""
+    for _ in $(seq 1 60); do
+        TUNNEL_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /root/.logs/tunnel.log 2>/dev/null | head -1 || true)
+        [[ -n "$TUNNEL_URL" ]] && break
+        sleep 0.5
+    done
+    if [[ -n "$TUNNEL_URL" ]]; then
+        echo "$TUNNEL_URL" > /root/.logs/tunnel-url.txt
+        TUNNEL_BANNER=$(cat <<TBEOF
+
+============================================================
+  PUBLIC TUNNEL ACTIVE — webapp exposed to the internet
+============================================================
+
+  $TUNNEL_URL
+
+  Anyone with this URL can reach your webapp; the URL is the
+  only access control. Stable until the next ./launch.sh.
+  Cached at /root/.logs/tunnel-url.txt inside the container.
+
+  attach: podman exec -it $CNAME tmux attach -t tunnel
+  log:    podman exec -it $CNAME tail -f /root/.logs/tunnel.log
+
+============================================================
+TBEOF
+)
+    else
+        TUNNEL_BANNER=$(cat <<TBEOF
+
+============================================================
+  PUBLIC TUNNEL — URL not detected after 30s
+============================================================
+
+  Check the tunnel session:
+    podman exec -it $CNAME tmux attach -t tunnel
+    podman exec -it $CNAME tail -f /root/.logs/tunnel.log
+
+============================================================
+TBEOF
+)
+    fi
+fi
+
 cat <<EOF
 
 ============================================================
@@ -148,6 +207,7 @@ To stop the container:
   or: press Ctrl+C / Ctrl+D in this terminal
 
 ============================================================
+$TUNNEL_BANNER
 
 EOF
 

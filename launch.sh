@@ -148,8 +148,19 @@ SLICE_NAME="rcode_${SAFE_PROJECT}.slice"
 WARMUP_UNIT="rcode_warmup_${SAFE_PROJECT}.service"
 NFT_TABLE="rcode_${SAFE_PROJECT}"
 
+EXPOSE_WEBAPP="${EXPOSE_WEBAPP:-false}"
+
+# When EXPOSE_WEBAPP=true, the container runs `cloudflared tunnel --url ...`
+# which dials out to Cloudflare's tunnel edge on TCP/UDP 7844. Auto-add
+# those endpoints to the resolved allowlist so the egress filter doesn't
+# kill the tunnel. Edge hostnames are anycast so the IPs are stable.
+TUNNEL_HOSTS=""
+if [[ "$EXPOSE_WEBAPP" == "true" ]]; then
+    TUNNEL_HOSTS="region1.v2.argotunnel.com region2.v2.argotunnel.com"
+fi
+
 GIT_HOST="$(echo "$REPO_URL" | sed -E 's#^(git@|ssh://git@|https://)##; s#[:/].*$##')"
-ALL_HOSTS="$GIT_HOST $WHITELIST_HOSTS"
+ALL_HOSTS="$GIT_HOST $WHITELIST_HOSTS $TUNNEL_HOSTS"
 
 # ---- podman wrapper (sudo only in rootful mode) ----------------------------
 
@@ -568,6 +579,7 @@ PODMAN_ARGS=(
     --env "WEBAPP_PORT=$WEBAPP_PORT"
     --env "RC_PORT=$RC_PORT"
     --env "CANARY_BLOCKED_IP=$CANARY_BLOCKED_IP"
+    --env "EXPOSE_WEBAPP=$EXPOSE_WEBAPP"
     --publish "127.0.0.1:${WEBAPP_PORT}:${WEBAPP_PORT}"
     --publish "127.0.0.1:${RC_PORT}:${RC_PORT}"
 )
