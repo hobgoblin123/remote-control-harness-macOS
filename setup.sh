@@ -17,6 +17,7 @@ set -euo pipefail
 # it only controls which host-side instructions are printed at the end.
 HOST_OS="${HOST_OS:-linux}"
 EXPOSE_WEBAPP="${EXPOSE_WEBAPP:-false}"
+DISABLE_NETWORK_BLOCK="${DISABLE_NETWORK_BLOCK:-false}"
 
 WORKDIR="/root/work/${PROJECT_NAME}"
 

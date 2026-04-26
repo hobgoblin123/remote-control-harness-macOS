@@ -9,6 +9,46 @@ reach them from a phone you need your own secure tunnel to the host
 (Tailscale, SSH port forward, etc.) — this repo deliberately doesn't
 expose anything on your LAN.
 
+### Public tunnel for the webapp (opt-in)
+
+For the `WEBAPP_PORT` specifically, the harness can also expose it to
+the public internet via a Cloudflare quick tunnel. Set `EXPOSE_WEBAPP=true`
+in `.env` and the next launch will:
+
+- start `cloudflared` in a `tunnel` tmux session inside the container
+- print a stable `https://*.trycloudflare.com` URL in the startup banner
+- cache the URL at `/root/.logs/tunnel-url.txt`
+
+The URL is stable for the container's lifetime and rotates on relaunch.
+No Cloudflare account or domain required. The egress allowlist is
+auto-extended with the Cloudflare tunnel edge endpoints
+(`region1.v2.argotunnel.com`, `region2.v2.argotunnel.com`).
+
+**What you're trading off:**
+
+- The URL is the only access control. Anyone with it can reach the
+  webapp — treat it like a secret.
+- Traffic flows through Cloudflare's edge: they terminate TLS and
+  re-encrypt over the tunnel, so request contents are visible to
+  Cloudflare.
+- Any vulnerability in the webapp is now exposed to the open internet
+  rather than just `localhost`.
+- Dev frameworks (Vite/Next/etc.) often reject requests where the
+  `Host` header isn't `localhost`. You may need to allow the
+  `*.trycloudflare.com` host in your dev server config.
+
+`RC_PORT` is **not** tunneled — only the webapp. The remote-control
+server stays bound to `127.0.0.1` and is reached over your existing
+secure path (claude pairing flow).
+
+If `EXPOSE_WEBAPP` is left unset (or set to anything other than `true`),
+no tunnel is started and no extra hosts are added to the allowlist.
+
+To pick up a change to `EXPOSE_WEBAPP` on an existing container, you
+need to remove the container so the new env var is applied at create
+time: `podman rm -f remote-code-<project>` (or `./launch.sh --reset`,
+which also wipes the volume).
+
 ## Connecting from VSCode
 
 VSCode's Dev Containers extension can attach to the running container via
@@ -62,7 +102,9 @@ tmux session named `remote-control` on container boot. Two ways to see
 what it's doing:
 
 ```bash
-# Attach to the live tmux session (Ctrl-b d to detach without killing it)
+# Attach to the live tmux session (Ctrl-a d to detach without killing it;
+# the container's tmux prefix is remapped from C-b to C-a so it doesn't
+# collide with a host-side tmux you're attaching through)
 podman exec -it remote-code-<project> tmux attach -t remote-control
 
 # Or just tail the mirrored log

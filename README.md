@@ -21,6 +21,7 @@
 - Has mise installed to setup any other dev environments you may need
 - Claude Code pre-installed (along with NodeJS and pnpm that Claude Code needs)
 - Optionally, it can mount a directory on host that you can configure as a read-only mount
+- Optionally exposes the webapp to the public internet via a Cloudflare quick tunnel (opt-in via `EXPOSE_WEBAPP` in `.env`)
 - When doing teardown, it checks git directories for any uncommitted files/commits before taking it down
 - Dev container to host notification via Unix domain socket comes built in
 
